@@ -224,6 +224,15 @@ should call `cancel_reservation`.
   against that same sample directory - it's the platform's own reference
   shape too (see `docs/concepts/tech-details.md` in the
   [rossoctl/rossoctl](https://github.com/rossoctl/rossoctl) repo).
+- **Chat returns `Error: Method Not Found` (JSON-RPC `-32601`).** Already
+  hit once: `a2a-sdk`'s JSON-RPC dispatcher has two method-name regimes -
+  native mode only recognizes gRPC-style names (`SendMessage`,
+  `GetTask`, ...), and the classic names Rossoctl's UI/backend actually
+  sends (`message/send`, etc.) only work with
+  `create_jsonrpc_routes(..., enable_v0_3_compat=True)`. `main.py` sets
+  that flag; if it's missing, every chat message fails auth (AuthBridge
+  logs show `inbound authorized`) but dies in the agent's own dispatcher
+  before it reaches `ReservationAgentExecutor`.
 - **`mcp` import errors** (`ModuleNotFoundError: No module named
   'mcp.server.fastmcp'`, or similar for `mcp.client.streamable_http`).
   Already hit once: `mcp` 2.0 renamed `FastMCP` to `MCPServer` (now
