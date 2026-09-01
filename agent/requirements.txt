@@ -1,0 +1,4 @@
+a2a-sdk>=0.2.5
+openai>=1.40.0
+mcp>=1.2.0
+uvicorn[standard]>=0.30.0

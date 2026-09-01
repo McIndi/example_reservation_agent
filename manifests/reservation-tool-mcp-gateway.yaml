@@ -1,0 +1,52 @@
+# Register the reservation MCP tool with MCP Gateway.
+#
+# Apply this after the tool Deployment/Service exist in your namespace
+# (either the Rossoctl UI's "Import" flow, or your own manifests).
+# MCP Gateway uses the HTTPRoute to reach the tool Service. The
+# registration adds the tool to the broker that serves the gateway's
+# /mcp endpoint.
+#
+# Modeled on ocp-runner/manifests/weather-tool-mcp-gateway.yaml in this
+# repo. Change NAMESPACE below to wherever you deployed the tool.
+#
+# This first registration has no credentialRef. If AuthBridge rejects
+# gateway discovery with 401, do not disable JWT validation - add a
+# dedicated gateway credential and audience policy instead, the same way
+# ocp-runner/scripts/configure-weather-tool-gateway-credential.sh does
+# for the weather tool. See the README in this folder.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: reservation-tool-route
+  namespace: NAMESPACE
+  labels:
+    mcp-server: "true"
+spec:
+  parentRefs:
+    - name: mcp-gateway
+      namespace: gateway-system
+      sectionName: mcps
+  hostnames:
+    - reservation-tool.mcp.local
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: reservation-tool-mcp
+          port: 8000
+---
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPServerRegistration
+metadata:
+  name: reservation-tool-servers
+  namespace: NAMESPACE
+spec:
+  toolPrefix: reservation_
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: reservation-tool-route
+    namespace: NAMESPACE
