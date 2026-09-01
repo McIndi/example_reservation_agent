@@ -55,45 +55,57 @@ example_reservation_agent/
 
 ## Prerequisites
 
-- An OpenShift cluster with Rossoctl **v0.7.0** installed. If you don't
-  have one yet, see
-  [Deploy Rossoctl to OpenShift with IBAC](../docs/how-to-guides/deploy-rossoctl-to-openshift-with-ibac.md)
-  in this repo, or the upstream `docs/ocp/openshift-install.md` in the
-  [rossoctl/rossoctl](https://github.com/rossoctl/rossoctl) repo for a
-  general install.
+- An OpenShift cluster with Rossoctl **v0.7.0** installed. See the
+  upstream `docs/ocp/openshift-install.md` in the
+  [rossoctl/rossoctl](https://github.com/rossoctl/rossoctl) repo if you
+  don't have one yet.
 - `oc` logged in to that cluster, and a namespace to deploy into (the
-  examples below use `team1`, matching this repo's other guides).
-- A container registry both your workstation and the cluster can reach
-  (Quay, GHCR, an internal registry, etc.), and `docker` or `podman` to
-  build and push images.
+  examples below use `team1`).
 - An LLM you can point the agent at - OpenAI, Anthropic, or an in-cluster
-  Ollama all work. See
-  [Point Rossoctl agents at a provider](../docs/how-to-guides/point-rossoctl-agents-at-a-provider.md)
-  for the three environment variables every Rossoctl agent reads.
+  Ollama all work. The agent reads three environment variables:
+  `LLM_API_BASE`, `LLM_MODEL`, and `LLM_API_KEY` (any non-empty value
+  for Ollama, which needs no real key).
 
 ## 1. Build and push the images
 
-```bash
-export REGISTRY=quay.io/<your-username>   # or your own registry
+This repo's `.github/workflows/build-and-push.yml` builds both images on
+every push to `main` and publishes them to GHCR:
 
-docker build -t $REGISTRY/reservation-tool:v0.1.0 tool/
-docker push $REGISTRY/reservation-tool:v0.1.0
+- `ghcr.io/mcindi/reservation-agent:latest`
+- `ghcr.io/mcindi/reservation-tool:latest`
 
-docker build -t $REGISTRY/reservation-agent:v0.1.0 agent/
-docker push $REGISTRY/reservation-agent:v0.1.0
-```
+(also tagged by short commit SHA, and by `vX.Y.Z` for any pushed `v*`
+tag). No local `docker build` needed - once a run completes on the
+[Actions tab](https://github.com/McIndi/example_reservation_agent/actions),
+the images are ready to deploy from.
 
-`rossoctl` also supports building straight from a git repo (Tekton +
-Shipwright, via `--with-builds`) instead of pushing pre-built images -
-see the **Import** dialog's "Build From Source" option in the UI. It
-needs `agent/` and `tool/` to each be a subfolder with its own
-`Dockerfile`, which they already are.
+**First-run note:** GHCR packages a repo creates for the first time
+often come out **private**, regardless of the source repo's own
+visibility. Check
+[github.com/orgs/McIndi/packages](https://github.com/orgs/McIndi/packages)
+(or the "Packages" link on the repo page) after the first run and set
+`reservation-agent` / `reservation-tool` to public, or link them to this
+repo so it inherits the repo's access - otherwise the cluster's `oc`
+image pulls in Step 2/3 below will fail with `ImagePullBackOff` /
+`unauthorized`.
+
+Prefer to build locally instead? `docker build -t <tag> tool/` and
+`docker build -t <tag> agent/` work the same way any other
+Dockerfile-based image does - push wherever your cluster can pull from.
+
+`rossoctl` also supports building straight from a git repo in-cluster
+(Tekton + Shipwright, via `--with-builds`) instead of a pre-built image -
+see the **Import** dialog's "Build From Source" option in the UI. That
+path needs the builds layer installed on the cluster first; the GHCR
+route above works without it.
 
 ## 2. Deploy the tool
 
 In the Rossoctl UI: **Tools -> Import -> Deploy From Image**.
 
-- Image: `$REGISTRY/reservation-tool:v0.1.0`
+- Image: `ghcr.io/mcindi/reservation-tool:latest` (or a specific commit
+  SHA / `vX.Y.Z` tag from the Actions run, for something more pinned
+  than `latest`)
 - Namespace: `team1` (or your own)
 - Turn on AuthBridge sidecar injection and SPIRE identity if your
   install runs with `injectTools=true` (it must, for the gateway to
@@ -148,19 +160,22 @@ turn off JWT validation to work around a `401` instead.
 
 In the Rossoctl UI: **Agents -> Import -> Deploy From Image**.
 
-- Image: `$REGISTRY/reservation-agent:v0.1.0`
+- Image: `ghcr.io/mcindi/reservation-agent:latest`
 - Namespace: `team1` (same namespace as the tool)
 
-Set these environment variables (swap in whichever LLM section applies
-to you from
-[Point Rossoctl agents at a provider](../docs/how-to-guides/point-rossoctl-agents-at-a-provider.md)):
+Set these environment variables. For an in-cluster Ollama (adjust the
+service name/model to whatever is actually running on your cluster):
 
 ```
-LLM_API_BASE=<your provider's OpenAI-compatible base URL>
-LLM_MODEL=<model name>
-LLM_API_KEY=<key, or "ollama" for a local model>
+LLM_API_BASE=http://ollama.ollama.svc.cluster.local:11434/v1
+LLM_MODEL=llama3.2:3b-instruct-fp16
+LLM_API_KEY=ollama
 MCP_URL=http://mcp-gateway-istio.gateway-system.svc.cluster.local:8080/mcp
 ```
+
+For OpenAI or Anthropic instead, use their usual OpenAI-compatible base
+URL, model name, and a real API key in place of the first three lines
+above.
 
 `MCP_URL` points at MCP Gateway, not at the tool directly - the gateway
 is what applies the `reservation_` tool prefix from the registration and
