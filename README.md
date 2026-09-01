@@ -208,14 +208,22 @@ should call `cancel_reservation`.
 
 ## Troubleshooting
 
-- **Agent errors on startup mentioning `a2a`.** This example targets
-  `a2a-sdk>=0.2.5`. If the installed version's `AgentExecutor` /
-  `TaskUpdater` / `A2AStarletteApplication` API has moved since this was
-  written, compare `agent/src/agent_executor.py` and `agent/src/main.py`
-  against the upstream LangGraph `a2a-currency-agent` sample referenced
-  in `docs/concepts/tech-details.md` of the
-  [rossoctl/rossoctl](https://github.com/rossoctl/rossoctl) repo - it
-  uses the same shape.
+- **Agent errors on startup mentioning `a2a`** (e.g.
+  `ModuleNotFoundError: No module named 'a2a.server.apps'`). Already hit
+  once: `a2a-sdk` v1.0 removed `A2AStarletteApplication` (and its
+  FastAPI/REST equivalents) in favor of composing route factories
+  (`create_agent_card_routes`, `create_jsonrpc_routes`) directly into a
+  plain Starlette app, and moved task/message construction onto helper
+  functions in `a2a.helpers` (`new_task_from_user_message`,
+  `new_text_message`, `new_text_part`, `get_message_text`) instead of
+  building `Part`/`TextPart` objects by hand. `agent/requirements.txt`
+  pins `a2a-sdk>=1.0.0` and `agent/src/agent_executor.py` /
+  `agent/src/main.py` use that v1.0 shape now, verified against
+  `a2aproject/a2a-samples/samples/python/agents/helloworld/`. If a
+  future `a2a-sdk` release moves the API again, compare those two files
+  against that same sample directory - it's the platform's own reference
+  shape too (see `docs/concepts/tech-details.md` in the
+  [rossoctl/rossoctl](https://github.com/rossoctl/rossoctl) repo).
 - **`mcp` import errors** (`ModuleNotFoundError: No module named
   'mcp.server.fastmcp'`, or similar for `mcp.client.streamable_http`).
   Already hit once: `mcp` 2.0 renamed `FastMCP` to `MCPServer` (now

@@ -1,18 +1,20 @@
 """Wires ReservationAgent into the A2A protocol.
 
-Modeled on the a2a-sdk quickstart shape (the same one the platform's own
-LangGraph a2a-currency-agent example uses - see
-docs/concepts/tech-details.md in the rossoctl repo). If a2a-sdk's API has
-moved since this was written, check that project's samples for the
-current AgentExecutor / TaskUpdater signatures.
+Matches the a2a-sdk v1.0 API (verified against
+a2aproject/a2a-samples/samples/python/agents/helloworld/agent_executor.py):
+task/status construction goes through the a2a.helpers functions, not
+manually-built Part/TextPart objects, and TaskState uses the
+TASK_STATE_* names. If a2a-sdk's API has moved again, compare this file
+against that sample - it's the platform's own reference for this shape
+(see docs/concepts/tech-details.md in the rossoctl repo).
 """
 from __future__ import annotations
 
+from a2a.helpers import get_message_text, new_task_from_user_message, new_text_message, new_text_part
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
-from a2a.types import Part, TextPart
-from a2a.utils import new_task
+from a2a.types import TaskState
 
 from .agent import ReservationAgent
 
@@ -22,15 +24,28 @@ class ReservationAgentExecutor(AgentExecutor):
         self._agent = ReservationAgent()
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        task = context.current_task
-        if not task:
-            task = new_task(context.message)
+        if context.current_task:
+            task = context.current_task
+        else:
+            task = new_task_from_user_message(context.message)
             await event_queue.enqueue_event(task)
 
-        updater = TaskUpdater(event_queue, task.id, task.context_id)
-        reply = await self._agent.invoke(context.get_user_input(), task.context_id)
-        await updater.add_artifact([Part(root=TextPart(text=reply))])
-        await updater.complete()
+        updater = TaskUpdater(
+            event_queue=event_queue, task_id=task.id, context_id=task.context_id
+        )
+        await updater.update_status(
+            state=TaskState.TASK_STATE_WORKING,
+            message=new_text_message("Thinking..."),
+        )
+
+        query = get_message_text(context.message)
+        reply = await self._agent.invoke(query or "", task.context_id)
+
+        await updater.add_artifact(parts=[new_text_part(text=reply, media_type="text/plain")])
+        await updater.update_status(
+            state=TaskState.TASK_STATE_COMPLETED,
+            message=new_text_message(reply),
+        )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         raise NotImplementedError("cancel is not supported by this example agent")

@@ -1,18 +1,25 @@
-"""Entry point: serves the reservation agent over A2A."""
+"""Entry point: serves the reservation agent over A2A.
+
+Uses the a2a-sdk v1.0 app-wiring API: A2AStarletteApplication was
+removed in favor of composing route factories directly into a Starlette
+app (verified against
+a2aproject/a2a-samples/samples/python/agents/helloworld/__main__.py).
+"""
 from __future__ import annotations
 
 import os
 
 import uvicorn
-from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore
-from a2a.types import AgentCapabilities, AgentCard, AgentSkill
+from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
+from starlette.applications import Starlette
 
 from .agent_executor import ReservationAgentExecutor
 
 PORT = int(os.environ.get("PORT", "8000"))
-AGENT_URL = os.environ.get("AGENT_URL", f"http://reservation-agent:{PORT}/")
+AGENT_URL = os.environ.get("AGENT_URL", f"http://reservation-agent:{PORT}")
 
 
 def build_agent_card() -> AgentCard:
@@ -24,6 +31,8 @@ def build_agent_card() -> AgentCard:
             "09:00-17:00, and books, cancels, or reschedules a "
             "reservation once the customer agrees on a time."
         ),
+        input_modes=["text/plain"],
+        output_modes=["text/plain"],
         tags=["scheduling", "reservations"],
         examples=[
             "I'd like to book a reservation this week",
@@ -34,24 +43,35 @@ def build_agent_card() -> AgentCard:
     return AgentCard(
         name="Reservation Agent",
         description="Books, cancels, and reschedules 30-minute reservations.",
-        url=AGENT_URL,
         version="0.1.0",
-        default_input_modes=["text"],
-        default_output_modes=["text"],
+        default_input_modes=["text/plain"],
+        default_output_modes=["text/plain"],
         capabilities=AgentCapabilities(streaming=False),
+        supported_interfaces=[
+            AgentInterface(
+                protocol_binding="JSONRPC",
+                url=AGENT_URL,
+                protocol_version="1.0",
+            )
+        ],
         skills=[skill],
     )
 
 
-def build_app() -> A2AStarletteApplication:
-    handler = DefaultRequestHandler(
+def build_app() -> Starlette:
+    agent_card = build_agent_card()
+    request_handler = DefaultRequestHandler(
         agent_executor=ReservationAgentExecutor(),
         task_store=InMemoryTaskStore(),
+        agent_card=agent_card,
     )
-    return A2AStarletteApplication(agent_card=build_agent_card(), http_handler=handler)
+    routes = []
+    routes.extend(create_agent_card_routes(agent_card))
+    routes.extend(create_jsonrpc_routes(request_handler, "/"))
+    return Starlette(routes=routes)
 
 
-app = build_app().build()
+app = build_app()
 
 
 if __name__ == "__main__":
