@@ -216,6 +216,17 @@ should call `cancel_reservation`.
   in `docs/concepts/tech-details.md` of the
   [rossoctl/rossoctl](https://github.com/rossoctl/rossoctl) repo - it
   uses the same shape.
+- **`mcp` import errors** (`ModuleNotFoundError: No module named
+  'mcp.server.fastmcp'`, or similar for `mcp.client.streamable_http`).
+  Already hit once: `mcp` 2.0 renamed `FastMCP` to `MCPServer` (now
+  `mcp.server.mcpserver.MCPServer`) and replaced the client's
+  `streamablehttp_client` + `ClientSession` pair with a single `Client`
+  that raises `MCPError` instead of returning `isError=True`. Both
+  `tool/requirements.txt` and `agent/requirements.txt` pin
+  `mcp>=2.0.0` and the code uses that v2 API - if a future `mcp` release
+  moves the API again, check
+  [py.sdk.modelcontextprotocol.io/migration](https://py.sdk.modelcontextprotocol.io/migration/)
+  against `tool/src/server.py` and `agent/src/mcp_client.py`.
 - **Agent can't reach the tool / every booking fails.** Check
   `MCP_URL` is set and that `oc get mcpserverregistration
   reservation-tool-servers -n team1` reports `READY=True` with at least

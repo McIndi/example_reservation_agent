@@ -1,19 +1,23 @@
 """MCP tool server: reservation availability, booking, cancellation, and
 rescheduling. Exposed over streamable HTTP, the same transport Rossoctl's
 MCP Gateway uses to register the platform's weather-tool example.
+
+Uses the mcp>=2.0 API: FastMCP was renamed to MCPServer, and host/port
+moved from the constructor to run(). See
+https://py.sdk.modelcontextprotocol.io/migration/ if this drifts again.
 """
 from __future__ import annotations
 
 import os
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from . import store
 from .store import ReservationError
 
 PORT = int(os.environ.get("PORT", "8000"))
 
-mcp = FastMCP("reservation-tool", host="0.0.0.0", port=PORT)
+mcp = MCPServer("reservation-tool")
 
 
 @mcp.tool()
@@ -118,4 +122,4 @@ def reschedule_reservation(reservation_id: str, new_date: str, new_time: str) ->
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=PORT)
