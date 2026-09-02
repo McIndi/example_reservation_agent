@@ -9,6 +9,10 @@ https://py.sdk.modelcontextprotocol.io/migration/ if this drifts again.
 Opens a fresh Client per call. That is not the most efficient pattern,
 but it keeps this example agent simple and avoids holding a session open
 across the LLM's think time.
+
+The client-side deadline is Client(read_timeout_seconds=...), a float.
+This version takes no http_client argument, so there is no custom httpx
+client to inject a timeout through - verified against mcp 2.1.1.
 """
 from __future__ import annotations
 
@@ -16,18 +20,17 @@ import json
 import os
 from typing import Any
 
-import httpx2
 from mcp import Client, MCPError
 
-# The call goes through MCP Gateway, AuthBridge, and IBAC before it reaches the
-# tool, so httpx's 5s default is too tight for that hop.
+# How long to wait for one tool result. The call goes through MCP Gateway,
+# AuthBridge, and IBAC before it reaches the tool, so it needs more room than a
+# direct call would, and the SDK leaves this unset by default, which gives a
+# wedged gateway no deadline at all.
 MCP_TIMEOUT_SECONDS = float(os.environ.get("MCP_TIMEOUT_SECONDS", "30"))
 
 
 async def call_tool(mcp_url: str, name: str, arguments: dict[str, Any]) -> Any:
-    async with Client(
-        mcp_url, http_client=httpx2.AsyncClient(timeout=MCP_TIMEOUT_SECONDS)
-    ) as client:
+    async with Client(mcp_url, read_timeout_seconds=MCP_TIMEOUT_SECONDS) as client:
         await client.initialize()
         try:
             result = await client.call_tool(name, arguments)
