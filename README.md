@@ -168,7 +168,7 @@ service name/model to whatever is actually running on your cluster):
 
 ```
 LLM_API_BASE=http://ollama.ollama.svc.cluster.local:11434/v1
-LLM_MODEL=llama3.2:3b-instruct-fp16
+LLM_MODEL=llama3.2:3b-instruct-q4_K_M
 LLM_API_KEY=ollama
 MCP_URL=http://mcp-gateway-istio.gateway-system.svc.cluster.local:8080/mcp
 ```
