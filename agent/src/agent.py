@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -169,6 +170,18 @@ TOOL_PROGRESS = {
 # event and keeps the connection from going quiet.
 ProgressCallback = Callable[[str], Awaitable[None]]
 
+# What the customer sees when a tool call could not be completed. Saying that
+# nothing was booked matters: the failure modes here are auth and network, and
+# a customer left unsure whether a booking landed is worse off than one told
+# plainly that it did not.
+TOOL_FAILURE_REPLY = (
+    "I couldn't reach the scheduling system just now, so I don't have a real "
+    "answer for you. Nothing has been booked or changed. Please try again in a "
+    "moment."
+)
+
+logger = logging.getLogger(__name__)
+
 
 class ReservationAgent:
     """Holds one chat client and a per-conversation message history."""
@@ -246,6 +259,7 @@ class ReservationAgent:
     ) -> str:
         history = self._history(context_id)
         self._trim(history)
+        checkpoint = len(history)
         history.append({"role": "user", "content": user_text})
 
         for _ in range(MAX_TOOL_ROUNDS):
@@ -266,6 +280,7 @@ class ReservationAgent:
             if not message.tool_calls:
                 return message.content or ""
 
+            tool_failure: Exception | None = None
             for tool_call in message.tool_calls:
                 if on_progress:
                     await on_progress(
@@ -281,7 +296,16 @@ class ReservationAgent:
                         "Still working",
                     )
                     content = json.dumps(result)
-                except Exception as exc:  # tool errors go back to the model, not the customer
+                except Exception as exc:
+                    # An exception here is an infrastructure failure - auth,
+                    # network, the gateway - never a business answer, because
+                    # "no slots that day" comes back as a successful result.
+                    # Handing it to the model invites a confident, invented
+                    # reply, so record it and end the turn instead.
+                    logger.warning(
+                        "tool call %s failed: %s", tool_call.function.name, exc
+                    )
+                    tool_failure = exc
                     content = json.dumps({"error": str(exc)})
                 history.append(
                     {
@@ -290,6 +314,14 @@ class ReservationAgent:
                         "content": content,
                     }
                 )
+
+            if tool_failure is not None:
+                # Roll the turn back rather than leave the failed exchange in
+                # history. A later turn that can see it will build on it, which
+                # is how a dead credential turns into a confidently invented
+                # booking confirmation.
+                del history[checkpoint:]
+                return TOOL_FAILURE_REPLY
 
         return (
             "I'm having trouble finishing that through the scheduling tool right "
