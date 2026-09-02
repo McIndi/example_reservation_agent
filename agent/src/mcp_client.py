@@ -22,7 +22,9 @@ import json
 import os
 from typing import Any
 
+import httpx2
 from mcp import Client, MCPError
+from mcp.client.streamable_http import streamable_http_client
 
 # How long to wait for one tool result. The call goes through MCP Gateway,
 # AuthBridge, and IBAC before it reaches the tool, so it needs more room than a
@@ -43,15 +45,39 @@ class ToolCallFailed(RuntimeError):
     """
 
 
-async def call_tool(mcp_url: str, name: str, arguments: dict[str, Any]) -> Any:
-    # Client.__aenter__ performs the handshake itself, so there is no separate
-    # initialize() step. Calling one raises AttributeError inside the session's
-    # task group, which surfaces as an opaque ExceptionGroup.
-    async with Client(mcp_url, read_timeout_seconds=MCP_TIMEOUT_SECONDS) as client:
-        try:
-            result = await client.call_tool(name, arguments)
-        except MCPError as exc:
-            raise RuntimeError(str(exc)) from exc
+async def call_tool(
+    mcp_url: str,
+    name: str,
+    arguments: dict[str, Any],
+    authorization: str | None = None,
+) -> Any:
+    """Call one tool, carrying the caller's identity if there is one.
+
+    AuthBridge's outbound leg is passthrough. It forwards what this process
+    sends and mints nothing of its own, so a tool call reaches the tool with
+    an identity only if the caller's Authorization header is copied onto it.
+    Without that, the tool's inbound jwt-validation rejects the call with
+    "missing Authorization header" and the turn fails.
+
+    Client() takes no headers, and passing a URL string makes it build its
+    own transport. Building the transport here is the supported way to
+    configure the HTTP client, per streamable_http_client's own docstring.
+    """
+    headers = {"Authorization": authorization} if authorization else {}
+    async with httpx2.AsyncClient(
+        headers=headers, timeout=MCP_TIMEOUT_SECONDS
+    ) as http_client:
+        transport = streamable_http_client(mcp_url, http_client=http_client)
+        # Client.__aenter__ performs the handshake itself, so there is no
+        # separate initialize() step. Calling one raises AttributeError inside
+        # the session's task group, surfacing as an opaque ExceptionGroup.
+        async with Client(
+            transport, read_timeout_seconds=MCP_TIMEOUT_SECONDS
+        ) as client:
+            try:
+                result = await client.call_tool(name, arguments)
+            except MCPError as exc:
+                raise RuntimeError(str(exc)) from exc
 
     if getattr(result, "is_error", False):
         raise ToolCallFailed(_error_text(result))

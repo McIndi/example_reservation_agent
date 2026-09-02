@@ -2,4 +2,5 @@ a2a-sdk>=1.0.0
 starlette>=0.37.0
 openai>=1.40.0
 mcp>=2.0.0
+httpx2>=2.5.0
 uvicorn[standard]>=0.30.0

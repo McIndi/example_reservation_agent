@@ -23,6 +23,20 @@ from a2a.types import TaskState
 from .agent import ReservationAgent
 
 
+def _authorization(context: RequestContext) -> str | None:
+    """Pull the caller's Authorization header off the inbound request.
+
+    a2a-sdk stashes the inbound headers on the call context, which is the
+    only place the customer's identity is available to this agent. It has to
+    ride along on every outbound tool call, because AuthBridge forwards what
+    this process sends rather than minting anything itself.
+    """
+    call_context = getattr(context, "call_context", None)
+    state = getattr(call_context, "state", None) or {}
+    headers = state.get("headers") or {}
+    return headers.get("authorization") or headers.get("Authorization")
+
+
 class ReservationAgentExecutor(AgentExecutor):
     def __init__(self) -> None:
         self._agent = ReservationAgent()
@@ -46,14 +60,17 @@ class ReservationAgentExecutor(AgentExecutor):
 
         query = get_message_text(context.message)
         reply = await self._agent.invoke(
-            query or "", task.context_id, on_progress=on_progress
+            query or "",
+            task.context_id,
+            on_progress=on_progress,
+            authorization=_authorization(context),
         )
 
+        # The reply goes out once. Sending it as an artifact and again as the
+        # terminal status message made Rossoctl's chat render both, so the
+        # customer saw the whole answer twice, run together in one bubble.
         await updater.add_artifact(parts=[new_text_part(text=reply, media_type="text/plain")])
-        await updater.update_status(
-            state=TaskState.TASK_STATE_COMPLETED,
-            message=new_text_message(reply),
-        )
+        await updater.update_status(state=TaskState.TASK_STATE_COMPLETED)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         raise NotImplementedError("cancel is not supported by this example agent")

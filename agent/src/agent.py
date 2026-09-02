@@ -191,6 +191,31 @@ TOOL_FAILURE_REPLY = (
 logger = logging.getLogger(__name__)
 
 
+def _describe(exc: BaseException, limit: int = 6) -> str:
+    """Flatten an exception into something a log line can carry.
+
+    A transport failure arrives as an ExceptionGroup whose str() is only
+    "unhandled errors in a TaskGroup (1 sub-exception)", which names
+    nothing at all. The cause sits in the group's members and in __cause__
+    chains, so walk both and report what is actually there.
+    """
+    seen: set[int] = set()
+    parts: list[str] = []
+    queue: list[BaseException] = [exc]
+    while queue and len(parts) < limit:
+        current = queue.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, BaseExceptionGroup):
+            queue.extend(current.exceptions)
+            continue
+        parts.append(f"{type(current).__name__}: {current}")
+        if current.__cause__ is not None:
+            queue.append(current.__cause__)
+    return " <- ".join(parts) if parts else f"{type(exc).__name__}: {exc}"
+
+
 class ReservationAgent:
     """Holds one chat client and a per-conversation message history."""
 
@@ -264,6 +289,7 @@ class ReservationAgent:
         user_text: str,
         context_id: str,
         on_progress: ProgressCallback | None = None,
+        authorization: str | None = None,
     ) -> str:
         history = self._history(context_id)
         self._trim(history)
@@ -301,6 +327,7 @@ class ReservationAgent:
                             MCP_URL,
                             MCP_TOOL_PREFIX + tool_call.function.name,
                             arguments,
+                            authorization=authorization,
                         ),
                         on_progress,
                         "Still working",
@@ -317,7 +344,10 @@ class ReservationAgent:
                     # from, and handing it over invites a confident, invented
                     # reply, so record it and end the turn instead.
                     logger.warning(
-                        "tool call %s failed: %s", tool_call.function.name, exc
+                        "tool call %s (sent as %s) failed: %s",
+                        tool_call.function.name,
+                        MCP_TOOL_PREFIX + tool_call.function.name,
+                        _describe(exc),
                     )
                     tool_failure = exc
                     content = json.dumps({"error": str(exc)})
