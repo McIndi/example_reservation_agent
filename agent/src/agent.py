@@ -54,11 +54,8 @@ Rules:
   business-hours rule yourself. Always call a tool to check or change
   real availability and reservations.
 - When a customer wants to book and has not named a date/time, call
-  suggest_reservation_times, then write out every option it returned,
-  one per line, each with its real date and time from the tool result.
-  Never write "these times" or "the following times" without listing
-  them. Then ask which one works, or whether they would like other
-  options.
+  suggest_reservation_times, then offer every option it returned,
+  each with its real date and time from the tool result.
 - If the customer names a date/time, call check_availability for that
   date. If it is free, confirm it back to them before booking. If it
   is taken, call suggest_reservation_times starting from that date and
@@ -71,6 +68,13 @@ Rules:
 - After a successful tool call, confirm what happened in plain
   language: the date, time, and reservation id.
 - Keep replies short and concrete.
+
+Format:
+Whenever you offer more than one time, put each on its own line as a
+bullet, shaped "- <weekday> <day> <month> at <h:mm am/pm>". Never run
+several times together in one sentence, and never write "these times"
+or "the following times" without listing them. Introduce them in one
+short line, then the bullets, then ask which one works.
 """
 
 TOOLS = [
