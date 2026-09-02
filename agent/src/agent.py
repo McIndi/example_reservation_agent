@@ -23,6 +23,14 @@ from . import mcp_client
 
 MCP_URL = os.environ.get("MCP_URL", "http://reservation-tool-mcp:8000/mcp")
 
+# MCP Gateway republishes a registered tool under the toolPrefix from its
+# MCPServerRegistration, so the same function this agent knows as
+# check_availability is reservation_check_availability once it is behind the
+# gateway. The model keeps seeing the short names, which keeps the prompt
+# readable; the prefix is added on the way out. Empty by default, because
+# MCP_URL defaults to the tool Service directly, where there is no prefix.
+MCP_TOOL_PREFIX = os.environ.get("MCP_TOOL_PREFIX", "")
+
 # One LLM call has to finish inside the caller's gap budget. Rossoctl's chat
 # proxy allows 120s between SSE events, and OpenShift's router cuts an idle
 # connection sooner than that by default, so a call that runs longer than this
@@ -290,7 +298,9 @@ class ReservationAgent:
                 try:
                     result = await self._with_heartbeat(
                         mcp_client.call_tool(
-                            MCP_URL, tool_call.function.name, arguments
+                            MCP_URL,
+                            MCP_TOOL_PREFIX + tool_call.function.name,
+                            arguments,
                         ),
                         on_progress,
                         "Still working",

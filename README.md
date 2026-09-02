@@ -171,6 +171,7 @@ LLM_API_BASE=http://ollama.ollama.svc.cluster.local:11434/v1
 LLM_MODEL=llama3.2:3b-instruct-q4_K_M
 LLM_API_KEY=ollama
 MCP_URL=http://mcp-gateway-istio.gateway-system.svc.cluster.local:8080/mcp
+MCP_TOOL_PREFIX=reservation_
 ```
 
 For OpenAI or Anthropic instead, use their usual OpenAI-compatible base
@@ -180,6 +181,12 @@ above.
 `MCP_URL` points at MCP Gateway, not at the tool directly - the gateway
 is what applies the `reservation_` tool prefix from the registration and
 enforces the AuthBridge/IBAC pipeline in front of the tool call.
+
+`MCP_TOOL_PREFIX` has to match that registration's `toolPrefix`. The
+gateway republishes `check_availability` as
+`reservation_check_availability`, so calling the short name through the
+gateway asks for a tool it does not serve. Leave it unset when `MCP_URL`
+points straight at the tool Service, where the names are unprefixed.
 
 Deploy, then wait for the pod:
 
