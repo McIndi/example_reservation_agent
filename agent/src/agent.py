@@ -296,11 +296,15 @@ class ReservationAgent:
                         "Still working",
                     )
                     content = json.dumps(result)
+                except mcp_client.ToolCallFailed as exc:
+                    # The tool ran and said no: that slot is taken, no such
+                    # reservation, that date is a weekend. The model has a
+                    # real answer to relay, so the turn carries on.
+                    content = json.dumps({"error": str(exc)})
                 except Exception as exc:
-                    # An exception here is an infrastructure failure - auth,
-                    # network, the gateway - never a business answer, because
-                    # "no slots that day" comes back as a successful result.
-                    # Handing it to the model invites a confident, invented
+                    # The tool did not answer at all - auth, network, the
+                    # gateway. There is nothing here for the model to work
+                    # from, and handing it over invites a confident, invented
                     # reply, so record it and end the turn instead.
                     logger.warning(
                         "tool call %s failed: %s", tool_call.function.name, exc

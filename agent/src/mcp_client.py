@@ -2,8 +2,10 @@
 returns its result as plain Python data.
 
 Uses the mcp>=2.0 API: streamablehttp_client + ClientSession were
-replaced by a single Client, which raises MCPError on a tool failure
-instead of returning an isError=True result. See
+replaced by a single Client. A tool that reports a business failure comes
+back as a normal result with is_error set, not as a raised exception, so
+the caller has to check for it. MCPError is reserved for protocol-level
+failures. See
 https://py.sdk.modelcontextprotocol.io/migration/ if this drifts again.
 
 Opens a fresh Client per call. That is not the most efficient pattern,
@@ -29,18 +31,66 @@ from mcp import Client, MCPError
 MCP_TIMEOUT_SECONDS = float(os.environ.get("MCP_TIMEOUT_SECONDS", "30"))
 
 
+class ToolCallFailed(RuntimeError):
+    """The tool ran and reported a failure.
+
+    Kept distinct from a transport, auth, or gateway failure because the
+    two need opposite handling. Here the tool answered ("that slot is
+    taken", "no reservation with that id") and the model has something
+    real to relay. A transport failure is no answer at all, and handing
+    that to a model invites an invented one. agent.py relies on the
+    difference.
+    """
+
+
 async def call_tool(mcp_url: str, name: str, arguments: dict[str, Any]) -> Any:
+    # Client.__aenter__ performs the handshake itself, so there is no separate
+    # initialize() step. Calling one raises AttributeError inside the session's
+    # task group, which surfaces as an opaque ExceptionGroup.
     async with Client(mcp_url, read_timeout_seconds=MCP_TIMEOUT_SECONDS) as client:
-        await client.initialize()
         try:
             result = await client.call_tool(name, arguments)
         except MCPError as exc:
             raise RuntimeError(str(exc)) from exc
 
-    for block in result.content:
-        if hasattr(block, "text"):
-            try:
-                return json.loads(block.text)
-            except json.JSONDecodeError:
-                return block.text
-    return None
+    if getattr(result, "is_error", False):
+        raise ToolCallFailed(_error_text(result))
+    return _unpack(result)
+
+
+def _error_text(result: Any) -> str:
+    """Join the text the tool sent back with its failure."""
+    parts = [b.text for b in result.content if hasattr(b, "text")]
+    return " ".join(parts) if parts else "the tool reported a failure"
+
+
+def _unpack(result: Any) -> Any:
+    """Turn a CallToolResult back into what the tool function returned.
+
+    A tool that returns a list arrives as one content block per element, so
+    reading only the first block silently truncates it. check_availability
+    reported one free slot out of sixteen that way, and
+    suggest_reservation_times offered one option when the agent is told to
+    offer three.
+
+    structured_content carries the whole value when the server sends it, with
+    a non-object return wrapped under a sole "result" key. MCP Gateway is not
+    guaranteed to forward it, so the content blocks remain a fallback.
+    """
+    structured = getattr(result, "structured_content", None)
+    if structured is not None:
+        if isinstance(structured, dict) and set(structured) == {"result"}:
+            return structured["result"]
+        return structured
+
+    values = [_parse(b.text) for b in result.content if hasattr(b, "text")]
+    if not values:
+        return None
+    return values[0] if len(values) == 1 else values
+
+
+def _parse(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text

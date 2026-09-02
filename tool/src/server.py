@@ -3,7 +3,10 @@ rescheduling. Exposed over streamable HTTP, the same transport Rossoctl's
 MCP Gateway uses to register the platform's weather-tool example.
 
 Uses the mcp>=2.0 API: FastMCP was renamed to MCPServer, and host/port
-moved from the constructor to run(). See
+moved from the constructor to run(). Business failures raise ToolError,
+which the SDK treats as anticipated and forwards to the caller with its
+message intact; anything else is treated as a crash and its text never
+leaves the server. See
 https://py.sdk.modelcontextprotocol.io/migration/ if this drifts again.
 """
 from __future__ import annotations
@@ -11,6 +14,7 @@ from __future__ import annotations
 import os
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import store
 from .store import ReservationError
@@ -45,7 +49,7 @@ def check_availability(date: str) -> list[str]:
     try:
         return store.check_availability(date)
     except ReservationError as exc:
-        raise ValueError(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
 
 @mcp.tool()
@@ -63,7 +67,7 @@ def suggest_reservation_times(count: int = 3, earliest_date: str | None = None) 
     try:
         return store.suggest_times(count=count, earliest_date=earliest_date)
     except ReservationError as exc:
-        raise ValueError(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
 
 @mcp.tool()
@@ -82,7 +86,7 @@ def book_reservation(customer_name: str, date: str, time: str) -> dict:
     try:
         return store.book_reservation(customer_name, date, time)
     except ReservationError as exc:
-        raise ValueError(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
 
 @mcp.tool()
@@ -91,7 +95,7 @@ def get_reservation(reservation_id: str) -> dict:
     try:
         return store.get_reservation(reservation_id)
     except ReservationError as exc:
-        raise ValueError(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
 
 @mcp.tool()
@@ -100,7 +104,7 @@ def cancel_reservation(reservation_id: str) -> dict:
     try:
         return store.cancel_reservation(reservation_id)
     except ReservationError as exc:
-        raise ValueError(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
 
 @mcp.tool()
@@ -118,7 +122,7 @@ def reschedule_reservation(reservation_id: str, new_date: str, new_time: str) ->
     try:
         return store.reschedule_reservation(reservation_id, new_date, new_time)
     except ReservationError as exc:
-        raise ValueError(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
 
 if __name__ == "__main__":
