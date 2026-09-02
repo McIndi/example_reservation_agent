@@ -13,14 +13,21 @@ across the LLM's think time.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import httpx2
 from mcp import Client, MCPError
 
+# The call goes through MCP Gateway, AuthBridge, and IBAC before it reaches the
+# tool, so httpx's 5s default is too tight for that hop.
+MCP_TIMEOUT_SECONDS = float(os.environ.get("MCP_TIMEOUT_SECONDS", "30"))
+
 
 async def call_tool(mcp_url: str, name: str, arguments: dict[str, Any]) -> Any:
-    async with Client(mcp_url, http_client=httpx2.AsyncClient()) as client:
+    async with Client(
+        mcp_url, http_client=httpx2.AsyncClient(timeout=MCP_TIMEOUT_SECONDS)
+    ) as client:
         await client.initialize()
         try:
             result = await client.call_tool(name, arguments)

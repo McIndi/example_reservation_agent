@@ -9,8 +9,11 @@ a slot or reservation id on its own.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import time
+from collections.abc import Awaitable, Callable
 from datetime import date
 
 from openai import AsyncOpenAI
@@ -18,6 +21,20 @@ from openai import AsyncOpenAI
 from . import mcp_client
 
 MCP_URL = os.environ.get("MCP_URL", "http://reservation-tool-mcp:8000/mcp")
+
+# One LLM call has to finish inside the caller's gap budget. Rossoctl's chat
+# proxy allows 120s between SSE events, and OpenShift's router cuts an idle
+# connection sooner than that by default, so a call that runs longer than this
+# should fail cleanly instead of hanging. openai-python's own defaults are 600s
+# with 2 retries, which turns one slow call into a 30-minute stall.
+LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "90"))
+
+# How often to re-emit a status line while one step is in flight. The caller's
+# timeout applies to the gap between SSE events, so a beat well under the
+# tightest ceiling in the path keeps a slow round alive however long inference
+# takes. OpenShift's router is the tightest one at 30s of inactivity by
+# default, which is why this is not simply set to a minute.
+HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", "10"))
 
 SYSTEM_PROMPT_TEMPLATE = """You are a scheduling assistant. You book 30-minute
 reservations, Monday-Friday, 09:00-17:00. Today's date is {today}.
@@ -131,6 +148,27 @@ TOOLS = [
 
 MAX_TOOL_ROUNDS = 4
 
+# Every round re-sends the whole history, so an unbounded history makes each
+# turn slower than the last. That bites hardest on CPU-only inference, where
+# prompt evaluation is not free.
+MAX_HISTORY_MESSAGES = 24
+
+# Shown to the customer while a tool call is in flight. On a slow model this is
+# the only thing they see for tens of seconds, so name the actual step.
+TOOL_PROGRESS = {
+    "suggest_reservation_times": "Looking for open times...",
+    "check_availability": "Checking that date...",
+    "book_reservation": "Booking that slot...",
+    "get_reservation": "Looking up that reservation...",
+    "cancel_reservation": "Cancelling that reservation...",
+    "reschedule_reservation": "Moving that reservation...",
+}
+
+# Called with a short status line at each step of a turn. agent_executor passes
+# one that pushes an A2A status update, which reaches the UI as its own SSE
+# event and keeps the connection from going quiet.
+ProgressCallback = Callable[[str], Awaitable[None]]
+
 
 class ReservationAgent:
     """Holds one chat client and a per-conversation message history."""
@@ -139,6 +177,8 @@ class ReservationAgent:
         self._client = AsyncOpenAI(
             base_url=os.environ["LLM_API_BASE"],
             api_key=os.environ.get("LLM_API_KEY", "unused"),
+            timeout=LLM_TIMEOUT_SECONDS,
+            max_retries=0,
         )
         self._model = os.environ["LLM_MODEL"]
         self._histories: dict[str, list[dict]] = {}
@@ -153,15 +193,72 @@ class ReservationAgent:
             ]
         return self._histories[context_id]
 
-    async def invoke(self, user_text: str, context_id: str) -> str:
+    def _trim(self, history: list[dict]) -> None:
+        """Drop the oldest exchanges, keeping the system prompt.
+
+        Cuts back to the next user message, so a tool result never ends up
+        first in the window without the assistant message that asked for it.
+        The completions API rejects that pairing.
+        """
+        if len(history) <= MAX_HISTORY_MESSAGES:
+            return
+        keep = history[-MAX_HISTORY_MESSAGES:]
+        while keep and keep[0].get("role") != "user":
+            keep.pop(0)
+        history[1:] = keep
+
+    async def _with_heartbeat(
+        self,
+        awaitable,
+        on_progress: ProgressCallback | None,
+        label: str,
+    ):
+        """Run one step, re-emitting a status line while it is in flight.
+
+        Per-round updates alone bound the gap between events to one LLM
+        call, which is still long enough to trip a 30s router timeout on
+        CPU inference. A beat bounds it to HEARTBEAT_SECONDS instead, and
+        needs no cluster-side setting that a later reinstall could drop.
+
+        The elapsed count keeps consecutive beats distinct rather than
+        repeating one phrase, and doubles as a progress signal on a model
+        slow enough to need this in the first place.
+        """
+        if on_progress is None:
+            return await awaitable
+        task = asyncio.ensure_future(awaitable)
+        started = time.monotonic()
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_SECONDS)
+                if done:
+                    return task.result()
+                await on_progress(f"{label} ({int(time.monotonic() - started)}s)...")
+        finally:
+            if not task.done():
+                task.cancel()
+
+    async def invoke(
+        self,
+        user_text: str,
+        context_id: str,
+        on_progress: ProgressCallback | None = None,
+    ) -> str:
         history = self._history(context_id)
+        self._trim(history)
         history.append({"role": "user", "content": user_text})
 
         for _ in range(MAX_TOOL_ROUNDS):
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=history,
-                tools=TOOLS,
+            if on_progress:
+                await on_progress("Thinking...")
+            response = await self._with_heartbeat(
+                self._client.chat.completions.create(
+                    model=self._model,
+                    messages=history,
+                    tools=TOOLS,
+                ),
+                on_progress,
+                "Still thinking",
             )
             message = response.choices[0].message
             history.append(message.model_dump(exclude_none=True))
@@ -170,10 +267,18 @@ class ReservationAgent:
                 return message.content or ""
 
             for tool_call in message.tool_calls:
+                if on_progress:
+                    await on_progress(
+                        TOOL_PROGRESS.get(tool_call.function.name, "Working on that...")
+                    )
                 arguments = json.loads(tool_call.function.arguments or "{}")
                 try:
-                    result = await mcp_client.call_tool(
-                        MCP_URL, tool_call.function.name, arguments
+                    result = await self._with_heartbeat(
+                        mcp_client.call_tool(
+                            MCP_URL, tool_call.function.name, arguments
+                        ),
+                        on_progress,
+                        "Still working",
                     )
                     content = json.dumps(result)
                 except Exception as exc:  # tool errors go back to the model, not the customer
