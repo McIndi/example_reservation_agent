@@ -13,7 +13,47 @@ permissions:
   packages: write
 
 jobs:
+  # The per-image smoke tests inside `build` prove each half imports and
+  # constructs. This proves the two halves talk to each other over MCP, which
+  # is where every bug that reached the cluster has actually lived. It gates
+  # the push, so a broken call path never reaches GHCR.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the tool
+        uses: docker/build-push-action@v7
+        with:
+          context: tool
+          load: true
+          tags: reservation-tool:integration
+          cache-from: type=gha,scope=tool
+
+      - name: Build the agent
+        uses: docker/build-push-action@v7
+        with:
+          context: agent
+          load: true
+          tags: reservation-agent:integration
+          cache-from: type=gha,scope=agent
+
+      - name: Start the tool
+        run: |
+          docker run -d --name reservation-tool --network host             -e PORT=8000 reservation-tool:integration
+
+      - name: Drive the tool from the agent image
+        run: |
+          docker run --rm --network host             -e MCP_URL=http://127.0.0.1:8000/mcp             reservation-agent:integration             python -m src.integrationtest
+
+      - name: Tool logs, if that failed
+        if: failure()
+        run: docker logs reservation-tool
+
   build:
+    needs: integration
     runs-on: ubuntu-latest
     strategy:
       matrix:
