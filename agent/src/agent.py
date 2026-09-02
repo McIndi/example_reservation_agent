@@ -16,6 +16,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 from datetime import date
+from typing import Any
 
 from openai import AsyncOpenAI
 
@@ -53,9 +54,11 @@ Rules:
   business-hours rule yourself. Always call a tool to check or change
   real availability and reservations.
 - When a customer wants to book and has not named a date/time, call
-  suggest_reservation_times and offer exactly three concrete
-  date/time options in your reply. Ask which one works, or whether
-  they would like other options.
+  suggest_reservation_times, then write out every option it returned,
+  one per line, each with its real date and time from the tool result.
+  Never write "these times" or "the following times" without listing
+  them. Then ask which one works, or whether they would like other
+  options.
 - If the customer names a date/time, call check_availability for that
   date. If it is free, confirm it back to them before booking. If it
   is taken, call suggest_reservation_times starting from that date and
@@ -216,6 +219,21 @@ def _describe(exc: BaseException, limit: int = 6) -> str:
     return " <- ".join(parts) if parts else f"{type(exc).__name__}: {exc}"
 
 
+def _summarize(result: Any) -> str:
+    """Describe a tool result in shape only, never in content.
+
+    Answers "did three options actually come back" when the model's reply
+    does not match what the tool returned, which is otherwise invisible
+    from outside the process. Customer names and booking details stay out
+    of the log.
+    """
+    if isinstance(result, list):
+        return f"list of {len(result)}"
+    if isinstance(result, dict):
+        return f"object with keys {sorted(result)}"
+    return type(result).__name__
+
+
 class ReservationAgent:
     """Holds one chat client and a per-conversation message history."""
 
@@ -331,6 +349,11 @@ class ReservationAgent:
                         ),
                         on_progress,
                         "Still working",
+                    )
+                    logger.info(
+                        "tool %s returned %s",
+                        tool_call.function.name,
+                        _summarize(result),
                     )
                     content = json.dumps(result)
                 except mcp_client.ToolCallFailed as exc:
