@@ -1,0 +1,145 @@
+# Deploy the reservation agent the way the Rossoctl UI's Import flow
+# would, but from a file you can diff and re-apply. This is the object
+# set that is live on the demo cluster.
+#
+# The AgentRuntime CR makes the Rossoctl operator inject the AuthBridge
+# sidecar and the proxy-init init container. Agents are injected whether
+# or not the install sets injectTools; that flag only affects tools. The
+# webhook moves the agent container to port 8001, puts AuthBridge's
+# reverse proxy on 8000 (which the Service targets), and sets
+# HTTP_PROXY/HTTPS_PROXY on the agent container to the sidecar's forward
+# proxy on 8081. Every outbound call the agent makes, to Ollama and to
+# MCP Gateway, therefore passes through the outbound pipeline: token
+# exchange, MCP parsing, and the IBAC judge.
+#
+# MCP_URL points at MCP Gateway, not the tool. MCP_TOOL_PREFIX matches the
+# toolPrefix in reservation-tool-mcp-gateway.yaml. Change NAMESPACE to
+# wherever you deploy, and the LLM_* values to your provider (see
+# docs/how-to-guides/point-rossoctl-agents-at-a-provider.md in ocp-runner).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: reservation-agent
+  namespace: NAMESPACE
+  labels:
+    rossoctl.io/managed-by: rossoctl-ui
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reservation-agent
+  namespace: NAMESPACE
+  annotations:
+    rossoctl.io/description: "Agent 'reservation-agent' deployed from existing image 'ghcr.io/mcindi/reservation-agent:latest'"
+  labels:
+    app.kubernetes.io/managed-by: rossoctl-ui
+    app.kubernetes.io/name: reservation-agent
+    app.kubernetes.io/component: agent
+spec:
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reservation-agent
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: reservation-agent
+    spec:
+      serviceAccount: reservation-agent
+      serviceAccountName: reservation-agent
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: agent
+          image: ghcr.io/mcindi/reservation-agent:latest
+          imagePullPolicy: Always
+          env:
+            - name: PORT
+              value: "8000"
+            - name: HOST
+              value: 0.0.0.0
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.rossoctl-system.svc.cluster.local:8335
+            - name: KEYCLOAK_URL
+              value: http://keycloak.keycloak.svc.cluster.local:8080
+            - name: UV_CACHE_DIR
+              value: /app/.cache/uv
+            - name: AGENT_ENDPOINT
+              value: http://reservation-agent.NAMESPACE.svc.cluster.local:8080
+            - name: LLM_API_BASE
+              value: http://ollama.ollama.svc.cluster.local:11434/v1
+            - name: LLM_MODEL
+              value: llama3.2:3b-instruct-q4_K_M
+            - name: LLM_API_KEY
+              value: ollama
+            - name: MCP_URL
+              value: http://mcp-gateway-istio.gateway-system.svc.cluster.local:8080/mcp
+            - name: MCP_TOOL_PREFIX
+              value: reservation_
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - mountPath: /app/.cache
+              name: cache
+            - mountPath: /.marvin
+              name: marvin
+            - mountPath: /shared
+              name: shared-data
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: marvin
+          emptyDir: {}
+        - name: shared-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reservation-agent
+  namespace: NAMESPACE
+  labels:
+    app.kubernetes.io/managed-by: rossoctl-ui
+    app.kubernetes.io/name: reservation-agent
+    app.kubernetes.io/component: agent
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: reservation-agent
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: agent.rossoctl.dev/v1alpha1
+kind: AgentRuntime
+metadata:
+  name: reservation-agent
+  namespace: NAMESPACE
+  labels:
+    app.kubernetes.io/managed-by: rossoctl-ui
+    rossoctl.io/type: agent
+spec:
+  type: agent
+  mtlsMode: disabled
+  tlsBridgeMode: disabled
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: reservation-agent

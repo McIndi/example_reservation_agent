@@ -38,8 +38,43 @@ example_reservation_agent/
       store.py             # in-memory availability/reservation logic
       server.py             # MCP tool server (FastMCP)
   manifests/
-    reservation-tool-mcp-gateway.yaml   # HTTPRoute + MCPServerRegistration
+    reservation-tool.yaml                # SA + Deployment + Service + AgentRuntime
+    reservation-agent.yaml               # same four objects for the agent
+    reservation-tool-mcp-gateway.yaml    # HTTPRoute + MCPServerRegistration
+    reservation-tool-token-refresher.yaml  # CronJob that keeps the gateway credential fresh
 ```
+
+## How a tool call is secured
+
+Every hop below is what runs on the demo cluster, checked against the
+live pods and sidecar logs on 2026-09-03.
+
+1. The Rossoctl UI sends the customer's message to the agent with the
+   customer's Keycloak token. The agent pod's AuthBridge sidecar
+   validates it (`inbound authorized`) and hands the request to the
+   agent container.
+2. The agent container has `HTTP_PROXY` and `HTTPS_PROXY` set to the
+   sidecar's forward proxy, `127.0.0.1:8081`, and `NO_PROXY` covering
+   loopback only. `mcp_client.py` builds its HTTP client with the
+   default `trust_env=True`, so every call to MCP Gateway, and every
+   call to Ollama, leaves through the sidecar.
+3. The sidecar's outbound chain runs `token-exchange` (passthrough here:
+   it forwards the customer's token), `mcp-parser` (tags `tools/call` as
+   an action), then `ibac`. IBAC asks the judge model whether the action
+   matches the intent the inbound `a2a-parser` recorded from the chat.
+   A mismatch is a `403` with `code=ibac.blocked`; the agent's log shows
+   it and the customer gets the "nothing has been booked or changed"
+   reply. `unclassified_policy` is `judge` on this cluster, so a plain
+   HTTP call from the agent would be judged too.
+4. MCP Gateway routes the call to `reservation-tool-mcp:8000`, which is
+   the tool pod's AuthBridge reverse proxy, not the tool. That sidecar
+   validates the forwarded token again and passes the call to the tool
+   on `8001`.
+
+What this does not do: the agent's own SPIFFE identity is never put on
+the call, and the tool accepts any valid Keycloak token for `rossoctl`.
+Authorization at the tool is coarse. The intent check is the control
+that decides.
 
 ## Limitations (read before you demo this)
 
@@ -101,70 +136,122 @@ route above works without it.
 
 ## 2. Deploy the tool
 
-In the Rossoctl UI: **Tools -> Import -> Deploy From Image**.
+Two paths work. The manifest path is the one that was run on the demo
+cluster: that install has no Tekton or Shipwright, and the UI's Import
+dialog rewrote the image tag on the weather-tool example, so the tool
+went in with `oc apply`. The UI path is the platform's documented one.
 
-- Image: `ghcr.io/mcindi/reservation-tool:latest` (or a specific commit
-  SHA / `vX.Y.Z` tag from the Actions run, for something more pinned
-  than `latest`)
-- Namespace: `team1` (or your own)
-- Turn on AuthBridge sidecar injection and SPIRE identity if your
-  install runs with `injectTools=true` (it must, for the gateway to
-  reach the tool through AuthBridge - see the IBAC deploy guide's
-  Step 7 for that flag)
+### Manifest path (tested)
 
-Rossoctl's AuthBridge sidecar claims the tool's own container port for
-its own health server, then moves your tool's listener up by one - this
-tripped up the weather-tool example too. If the import gives your
-container port `8000`, confirm it after the Deployment exists:
+`manifests/reservation-tool.yaml` carries the ServiceAccount, Deployment,
+Service, and the `AgentRuntime` CR that tells the Rossoctl operator to
+inject the AuthBridge sidecar and SPIRE identity. It is the same object
+set the UI's Import flow creates.
 
 ```bash
-oc get pod -n team1 -l app.kubernetes.io/name=reservation-tool -o json | \
-  jq '.items[0].spec.containers[] | {name, ports}'
-```
-
-If the tool container's actual listener ends up on a different port than
-the Service targets (the weather-tool example needed `PORT=8000` on the
-container with the Service's `targetPort` also patched to `8000`, while
-AuthBridge's proxy took `8000` externally and pushed the tool itself to
-`8001` internally), match that pattern:
-
-```bash
-oc set env deployment/reservation-tool -n team1 PORT=8000
-oc patch service reservation-tool-mcp -n team1 --type=json -p='[
-  {"op": "replace", "path": "/spec/ports/0/port", "value": 8000},
-  {"op": "replace", "path": "/spec/ports/0/targetPort", "value": 8000}
-]'
+sed 's/NAMESPACE/team1/' manifests/reservation-tool.yaml | oc apply -f -
 oc rollout status deployment/reservation-tool -n team1 --timeout=300s
 ```
 
-Register the tool with MCP Gateway:
+### UI path
+
+**Tools -> Import -> Deploy From Image**, image
+`ghcr.io/mcindi/reservation-tool:latest`, namespace `team1`. Turn on
+AuthBridge sidecar injection and SPIRE identity. The install must run
+with `injectTools=true` for a tool to get its sidecar at all (see the
+IBAC deploy guide's Step 7). If the Deployment comes up with a different
+image tag than you typed, `oc set image` it back.
+
+### Check the ports
+
+Either way, the operator's webhook moves the tool's listener from `8000`
+to `8001` and puts AuthBridge's reverse proxy on `8000`. The Service
+keeps targeting `8000`, so every request to the tool passes through
+AuthBridge first. Confirm it:
+
+```bash
+oc get pod -n team1 -l app.kubernetes.io/name=reservation-tool -o json | \
+  jq '.items[0].spec.containers[] | {name, ports, PORT: [.env[]? | select(.name=="PORT") | .value]}'
+```
+
+The `mcp` container must show `containerPort: 8001` and `PORT=8001`. The
+`authbridge-proxy` container must show `reverse-proxy` on `8000`. If the
+import put the tool on `9090` instead, the moved listener lands on
+`9091`, where the sidecar's health server already is, and the tool
+crash-loops. Redeploy with port `8000`.
+
+### Register with MCP Gateway
 
 ```bash
 sed 's/NAMESPACE/team1/' manifests/reservation-tool-mcp-gateway.yaml | oc apply -f -
 ```
 
-Check it came up:
+The registration is not ready yet. The tool's inbound AuthBridge rejects
+MCP Gateway's discovery request with `401` because the gateway has no
+credential for this tool. Do not turn off JWT validation. Create a
+dedicated Keycloak client and credential Secret with the platform's
+weather-tool script, pointed at this tool through its environment
+variables. This is the exact invocation that was run on the demo
+cluster; `/vagrant` is where the `ocp-runner` VM mounts this repo's
+parent folder:
+
+```bash
+NS=team1 \
+DEPLOYMENT=reservation-tool \
+REGISTRATION=reservation-tool-servers \
+DISCOVERY_CLIENT_ID=mcp-gateway-reservation-discovery \
+DISCOVERY_SECRET=reservation-tool-gateway-credential \
+CLIENT_SECRET_NAME=reservation-tool-discovery-client \
+SETTINGS_CONFIGMAP=reservation-tool-token-refresher-settings \
+MAPPER_NAME=reservation-tool-audience \
+/vagrant/scripts/configure-weather-tool-gateway-credential.sh
+```
+
+The script reads the tool's SPIFFE id from its sidecar
+(`spiffe://<trust-domain>/ns/team1/sa/reservation-tool`), creates the
+Keycloak client with that audience, stores the client id and secret in
+`reservation-tool-discovery-client`, mints the first token into
+`reservation-tool-gateway-credential`, and patches `credentialRef` onto
+the registration. It must print `Audience verified`. Then:
 
 ```bash
 oc get mcpserverregistration reservation-tool-servers -n team1 \
   -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,TOOLS:.status.discoveredTools'
 ```
 
-If `READY` is not `True`, the tool almost certainly needs a gateway
-credential, the same way the weather-tool example does. Copy
-`ocp-runner/scripts/configure-weather-tool-gateway-credential.sh`,
-swap every `weather-tool` for `reservation-tool`, and run it - do not
-turn off JWT validation to work around a `401` instead.
+must report `READY=True` and `7` tools.
+
+### Keep the credential fresh
+
+That token lives 3,600 seconds. Install the refresher, which mints a new
+one every 30 minutes and may patch only that one Secret, and run it once
+now instead of waiting for the schedule:
+
+```bash
+sed 's/NAMESPACE/team1/' manifests/reservation-tool-token-refresher.yaml | oc apply -f -
+JOB="reservation-tool-token-refresh-test-$(date +%s)"
+oc create job --from=cronjob/reservation-tool-token-refresher "${JOB}" -n team1
+oc wait --for=condition=complete "job/${JOB}" -n team1 --timeout=180s
+oc logs "job/${JOB}" -n team1
+```
+
+The log must end with `Credential refreshed; expires_in=3600`.
 
 ## 3. Deploy the agent
 
-In the Rossoctl UI: **Agents -> Import -> Deploy From Image**.
+`manifests/reservation-agent.yaml` carries the ServiceAccount,
+Deployment, Service, and `AgentRuntime` CR, with the environment below
+already set for the in-cluster Ollama. Agents get the AuthBridge sidecar
+whether or not `injectTools` is set; that flag only affects tools.
 
-- Image: `ghcr.io/mcindi/reservation-agent:latest`
-- Namespace: `team1` (same namespace as the tool)
+```bash
+sed 's/NAMESPACE/team1/' manifests/reservation-agent.yaml | oc apply -f -
+oc rollout status deployment/reservation-agent -n team1 --timeout=300s
+```
 
-Set these environment variables. For an in-cluster Ollama (adjust the
-service name/model to whatever is actually running on your cluster):
+The UI path is **Agents -> Import -> Deploy From Image**, image
+`ghcr.io/mcindi/reservation-agent:latest`, namespace `team1`, with these
+environment variables:
 
 ```
 LLM_API_BASE=http://ollama.ollama.svc.cluster.local:11434/v1
@@ -178,6 +265,11 @@ For OpenAI or Anthropic instead, use their usual OpenAI-compatible base
 URL, model name, and a real API key in place of the first three lines
 above.
 
+`LLM_MODEL` is the same quantized model the IBAC judge uses. Ollama on
+the demo cluster serves one request at a time, so running two resident
+models would force a reload on every alternation between an agent turn
+and a judge call.
+
 `MCP_URL` points at MCP Gateway, not at the tool directly - the gateway
 is what applies the `reservation_` tool prefix from the registration and
 enforces the AuthBridge/IBAC pipeline in front of the tool call.
@@ -188,11 +280,36 @@ gateway republishes `check_availability` as
 gateway asks for a tool it does not serve. Leave it unset when `MCP_URL`
 points straight at the tool Service, where the names are unprefixed.
 
-Deploy, then wait for the pod:
+### Pin the images
+
+`imagePullPolicy: Always` with `:latest` means any restart can pick up
+whatever CI published last. The demo cluster pins both Deployments to a
+digest after each verified build:
 
 ```bash
-oc rollout status deployment/reservation-agent -n team1 --timeout=300s
+oc set image deployment/reservation-agent -n team1 agent=ghcr.io/mcindi/reservation-agent@sha256:<digest>
+oc set image deployment/reservation-tool -n team1 mcp=ghcr.io/mcindi/reservation-tool@sha256:<digest>
 ```
+
+Digests are on each package's page under
+[github.com/orgs/McIndi/packages](https://github.com/orgs/McIndi/packages),
+or in the `build-and-push` run's log.
+
+### Confirm the routing
+
+Before the first chat, check that the agent's outbound traffic is wired
+through its sidecar:
+
+```bash
+oc exec -n team1 deploy/reservation-agent -c agent -- sh -c \
+  'env | sort | grep -E "^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|MCP_URL|MCP_TOOL_PREFIX)="'
+```
+
+Expected: `HTTP_PROXY` and `HTTPS_PROXY` equal `http://127.0.0.1:8081`,
+`NO_PROXY` is `127.0.0.1,localhost`, and the two `MCP_` values match
+Step 3. The pod also has a `proxy-init` init container from the operator
+that sets up the sidecar's transparent proxy on `8082`, so traffic that
+ignores those variables still passes through the sidecar.
 
 ## 4. Try it
 
@@ -253,8 +370,31 @@ should call `cancel_reservation`.
   against `tool/src/server.py` and `agent/src/mcp_client.py`.
 - **Agent can't reach the tool / every booking fails.** Check
   `MCP_URL` is set and that `oc get mcpserverregistration
-  reservation-tool-servers -n team1` reports `READY=True` with at least
-  one discovered tool, per Step 2 above.
+  reservation-tool-servers -n team1` reports `READY=True` with seven
+  discovered tools, per Step 2 above. If the registration went back to
+  `401`, the gateway credential expired: check the last
+  `reservation-tool-token-refresher` Job's log.
+- **The customer gets "I couldn't reach the scheduling system", and the
+  agent log says `code=ibac.blocked`.** That is IBAC enforcement, not an
+  outage. The judge decided the tool call contradicted the intent the
+  customer stated earlier in the same conversation; the reason is on the
+  same log line, in both the agent container's log and the sidecar's:
+
+  ```bash
+  oc logs deploy/reservation-agent -n team1 -c authbridge-proxy | grep -E 'tools/call|ibac'
+  ```
+
+  Seen once on the demo cluster: a customer said they did not want to
+  cancel, the model called `cancel_reservation` anyway, and the sidecar
+  returned `403`. The agent rolled the turn back so the model could not
+  build on the failed call. Intent is tracked per conversation, so start
+  a new one if the block was a false positive. An allowed call writes no
+  `allow` line; it shows as `mcp-parser: request method=tools/call
+  isAction=true` followed by a response.
+- **`tools/call` never appears in the sidecar log.** The agent is
+  bypassing its sidecar. Re-run the environment check at the end of
+  Step 3; `HTTP_PROXY` must point at `127.0.0.1:8081`. A client built
+  with `trust_env=False` would also bypass it.
 - **`ImagePullBackOff` after import.** The UI's Import flow can rewrite
   your image tag - the weather-tool example hits this too. Confirm the
   Deployment's image with `oc get deployment reservation-tool -n team1

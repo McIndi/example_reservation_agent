@@ -19,7 +19,16 @@ from starlette.applications import Starlette
 from .agent_executor import ReservationAgentExecutor
 
 PORT = int(os.environ.get("PORT", "8000"))
-AGENT_URL = os.environ.get("AGENT_URL", f"http://reservation-agent:{PORT}")
+# Rossoctl sets AGENT_ENDPOINT on every agent it deploys, to the Service
+# address on port 8080. That is the address a client can reach; the container
+# port is not, because the AuthBridge webhook moves it to 8001 and puts the
+# sidecar's reverse proxy in front. Honor AGENT_ENDPOINT first so the agent
+# card advertises the reachable one.
+AGENT_URL = (
+    os.environ.get("AGENT_ENDPOINT")
+    or os.environ.get("AGENT_URL")
+    or f"http://reservation-agent:{PORT}"
+)
 
 
 def build_agent_card() -> AgentCard:

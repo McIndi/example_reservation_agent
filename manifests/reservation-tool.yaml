@@ -1,0 +1,135 @@
+# Deploy the reservation MCP tool the way the Rossoctl UI's Import flow
+# would, but from a file you can diff and re-apply.
+#
+# This is the object set that is live on the demo cluster. The UI path
+# was not usable there: the cluster has no Tekton or Shipwright, and the
+# Import dialog rewrote the image tag on the weather-tool example, so the
+# tool went in with `oc apply` instead.
+#
+# The AgentRuntime CR is what makes the Rossoctl operator inject the
+# AuthBridge sidecar, the proxy-init init container, and SPIRE identity.
+# The operator's webhook then moves the mcp container to port 8001 and
+# puts AuthBridge's reverse proxy on 8000, so the Service below keeps
+# targeting 8000 and every request reaches the tool through AuthBridge.
+#
+# Change NAMESPACE to wherever you deploy. Pin the image to a digest with
+# `oc set image` once you have a verified build (see the README).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: reservation-tool
+  namespace: NAMESPACE
+  labels:
+    rossoctl.io/managed-by: rossoctl-ui
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reservation-tool
+  namespace: NAMESPACE
+  annotations:
+    rossoctl.io/description: "Tool 'reservation-tool' deployed from existing image 'ghcr.io/mcindi/reservation-tool:latest'"
+  labels:
+    app.kubernetes.io/managed-by: rossoctl-operator
+    app.kubernetes.io/name: reservation-tool
+spec:
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reservation-tool
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: reservation-tool
+    spec:
+      serviceAccount: reservation-tool
+      serviceAccountName: reservation-tool
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mcp
+          image: ghcr.io/mcindi/reservation-tool:latest
+          imagePullPolicy: Always
+          env:
+            - name: PORT
+              value: "8000"
+            - name: HOST
+              value: 0.0.0.0
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.rossoctl-system.svc.cluster.local:8335
+            - name: KEYCLOAK_URL
+              value: http://keycloak.keycloak.svc.cluster.local:8080
+            - name: UV_CACHE_DIR
+              value: /app/.cache/uv
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsUser: 1000
+          volumeMounts:
+            - mountPath: /app/.cache
+              name: cache
+            - mountPath: /tmp
+              name: tmp
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reservation-tool-mcp
+  namespace: NAMESPACE
+  labels:
+    app.kubernetes.io/managed-by: rossoctl-ui
+    app.kubernetes.io/name: reservation-tool
+    protocol.rossoctl.io/mcp: ""
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: reservation-tool
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: agent.rossoctl.dev/v1alpha1
+kind: AgentRuntime
+metadata:
+  name: reservation-tool
+  namespace: NAMESPACE
+  labels:
+    app.kubernetes.io/managed-by: rossoctl-ui
+    rossoctl.io/type: tool
+spec:
+  type: tool
+  mtlsMode: disabled
+  tlsBridgeMode: disabled
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: reservation-tool

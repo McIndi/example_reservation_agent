@@ -126,16 +126,10 @@ def reschedule_reservation(reservation_id: str, new_date: str, new_time: str) ->
 
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="streamable-http",
-        host="0.0.0.0",
-        port=PORT,
-        # Answer with one application/json body instead of the default
-        # text/event-stream. Rossoctl puts AuthBridge and IBAC in front of this
-        # tool, and they have to read the whole response to judge it. Streaming
-        # it back through that proxy failed with bytesWritten=0 and a response
-        # frame cancelled after headers were already sent, which reached the
-        # agent as "Unexpected content type: text/plain". A single buffered
-        # body has no stream for the proxy to lose.
-        json_response=True,
-    )
+    # Left on the default text/event-stream deliberately. Answering in JSON was
+    # tried against an "Unexpected content type: text/plain" failure that turned
+    # out to be MCP Gateway mislabelling its own tool-not-found error, nothing to
+    # do with this transport. The platform's weather-tool answers with SSE and
+    # works through this gateway, so matching it removes a difference rather than
+    # adding one.
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=PORT)

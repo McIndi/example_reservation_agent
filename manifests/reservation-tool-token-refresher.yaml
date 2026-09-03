@@ -1,0 +1,237 @@
+# Keep MCP Gateway's credential for the reservation tool fresh.
+#
+# The credential script (see the README, Step 2) creates a Keycloak client
+# for the gateway, stores its client id and secret in the
+# reservation-tool-discovery-client Secret, writes the token URL, expected
+# audience, and target Secret name into the
+# reservation-tool-token-refresher-settings ConfigMap, and mints the first
+# access token into reservation-tool-gateway-credential. That token lives
+# 3,600 seconds. This CronJob mints a new one every 30 minutes and patches
+# it into the credential Secret, which is the only Secret its Role lets it
+# touch.
+#
+# Modeled on ocp-runner/manifests/weather-tool-token-refresher.yaml. The
+# script is the same one. Change NAMESPACE to wherever the tool runs.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: reservation-tool-token-refresher
+  namespace: NAMESPACE
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: reservation-tool-token-refresher
+  namespace: NAMESPACE
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["reservation-tool-gateway-credential"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: reservation-tool-token-refresher
+  namespace: NAMESPACE
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: reservation-tool-token-refresher
+subjects:
+  - kind: ServiceAccount
+    name: reservation-tool-token-refresher
+    namespace: NAMESPACE
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reservation-tool-token-refresher
+  namespace: NAMESPACE
+data:
+  refresh.py: |
+    import base64
+    import json
+    import os
+    import ssl
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    keycloak_url = os.environ["KEYCLOAK_TOKEN_URL"]
+    client_id = os.environ["CLIENT_ID"]
+    client_secret = os.environ["CLIENT_SECRET"]
+    expected_audience = os.environ["EXPECTED_AUDIENCE"]
+    target_secret = os.environ["TARGET_SECRET"]
+
+    form = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }).encode()
+
+    request = urllib.request.Request(
+        keycloak_url,
+        data=form,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            token_response = json.load(response)
+    except urllib.error.HTTPError as error:
+        body = error.read().decode(errors="replace")
+        raise RuntimeError(
+            f"Keycloak returned HTTP {error.code}: {body}"
+        ) from error
+
+    access_token = token_response.get("access_token")
+    if not access_token:
+        raise RuntimeError("Keycloak response has no access_token")
+
+    segment = access_token.split(".")[1]
+    segment += "=" * (-len(segment) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(segment))
+
+    audiences = claims.get("aud", [])
+    if isinstance(audiences, str):
+        audiences = [audiences]
+
+    if expected_audience not in audiences:
+        raise RuntimeError(
+            f"Expected audience {expected_audience!r}; got {audiences!r}"
+        )
+
+    namespace_file = (
+        "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+    )
+    token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+    with open(namespace_file, encoding="utf-8") as file_handle:
+        namespace = file_handle.read().strip()
+
+    with open(token_file, encoding="utf-8") as file_handle:
+        service_account_token = file_handle.read().strip()
+
+    encoded_credential = base64.b64encode(
+        f"Bearer {access_token}".encode()
+    ).decode()
+
+    patch = json.dumps({
+        "data": {
+            "token": encoded_credential,
+        }
+    }).encode()
+
+    secret_url = (
+        "https://kubernetes.default.svc"
+        f"/api/v1/namespaces/{namespace}/secrets/{target_secret}"
+    )
+
+    patch_request = urllib.request.Request(
+        secret_url,
+        data=patch,
+        method="PATCH",
+        headers={
+            "Authorization": f"Bearer {service_account_token}",
+            "Content-Type": "application/merge-patch+json",
+        },
+    )
+
+    context = ssl.create_default_context(cafile=ca_file)
+
+    with urllib.request.urlopen(
+        patch_request,
+        timeout=30,
+        context=context,
+    ) as response:
+        if response.status != 200:
+            raise RuntimeError(
+                f"Secret patch returned HTTP {response.status}"
+            )
+
+    expires_in = token_response.get("expires_in", "unknown")
+    print(
+        f"Credential refreshed; expires_in={expires_in}; "
+        f"audience={expected_audience}"
+    )
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reservation-tool-token-refresher
+  namespace: NAMESPACE
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 120
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: reservation-tool-token-refresher
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
+          volumes:
+            - name: script
+              configMap:
+                name: reservation-tool-token-refresher
+          containers:
+            - name: refresh
+              image: registry.access.redhat.com/ubi9/python-312:1
+              imagePullPolicy: Always
+              command: ["python3", "/opt/refresher/refresh.py"]
+              env:
+                - name: KEYCLOAK_TOKEN_URL
+                  valueFrom:
+                    configMapKeyRef:
+                      name: reservation-tool-token-refresher-settings
+                      key: token-url
+                - name: EXPECTED_AUDIENCE
+                  valueFrom:
+                    configMapKeyRef:
+                      name: reservation-tool-token-refresher-settings
+                      key: expected-audience
+                - name: TARGET_SECRET
+                  valueFrom:
+                    configMapKeyRef:
+                      name: reservation-tool-token-refresher-settings
+                      key: target-secret
+                - name: CLIENT_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: reservation-tool-discovery-client
+                      key: client-id
+                - name: CLIENT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: reservation-tool-discovery-client
+                      key: client-secret
+                - name: PYTHONDONTWRITEBYTECODE
+                  value: "1"
+              volumeMounts:
+                - name: script
+                  mountPath: /opt/refresher/refresh.py
+                  subPath: refresh.py
+                  readOnly: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                readOnlyRootFilesystem: true
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 192Mi
