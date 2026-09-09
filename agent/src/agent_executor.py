@@ -19,7 +19,9 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import TaskState
+from opentelemetry.trace import SpanKind, Status, StatusCode
 
+from . import tracing
 from .agent import ReservationAgent
 
 
@@ -40,6 +42,7 @@ def _authorization(context: RequestContext) -> str | None:
 class ReservationAgentExecutor(AgentExecutor):
     def __init__(self) -> None:
         self._agent = ReservationAgent()
+        self._tracer = tracing.get_tracer()
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         if context.current_task:
@@ -59,12 +62,33 @@ class ReservationAgentExecutor(AgentExecutor):
             )
 
         query = get_message_text(context.message)
-        reply = await self._agent.invoke(
-            query or "",
-            task.context_id,
-            on_progress=on_progress,
-            authorization=_authorization(context),
-        )
+
+        # Root span for the whole turn. Named and attributed per
+        # docs/agents/otel-instrumentation.md in the rossoctl repo: the
+        # gen_ai.* attributes are what Phoenix's and MLflow's OTEL Collector
+        # transforms key off of.
+        with self._tracer.start_as_current_span(
+            f"invoke_agent {tracing.AGENT_NAME}", kind=SpanKind.INTERNAL
+        ) as span:
+            span.set_attribute("gen_ai.operation.name", "invoke_agent")
+            span.set_attribute("gen_ai.provider.name", "openai")
+            span.set_attribute("gen_ai.agent.name", tracing.AGENT_NAME)
+            span.set_attribute("gen_ai.conversation.id", task.context_id)
+            span.set_attribute("openinference.span.kind", "AGENT")
+            span.set_attribute("input.value", query or "")
+            try:
+                reply = await self._agent.invoke(
+                    query or "",
+                    task.context_id,
+                    on_progress=on_progress,
+                    authorization=_authorization(context),
+                )
+                span.set_attribute("output.value", reply)
+                span.set_status(Status(StatusCode.OK))
+            except Exception as exc:
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                span.record_exception(exc)
+                raise
 
         # The reply goes out once. Sending it as an artifact and again as the
         # terminal status message made Rossoctl's chat render both, so the

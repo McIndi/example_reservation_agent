@@ -19,8 +19,9 @@ from datetime import date
 from typing import Any
 
 from openai import AsyncOpenAI
+from opentelemetry.trace import SpanKind, Status, StatusCode
 
-from . import mcp_client
+from . import mcp_client, tracing
 
 MCP_URL = os.environ.get("MCP_URL", "http://reservation-tool-mcp:8000/mcp")
 
@@ -250,6 +251,7 @@ class ReservationAgent:
         )
         self._model = os.environ["LLM_MODEL"]
         self._histories: dict[str, list[dict]] = {}
+        self._tracer = tracing.get_tracer()
 
     def _history(self, context_id: str) -> list[dict]:
         if context_id not in self._histories:
@@ -321,15 +323,48 @@ class ReservationAgent:
         for _ in range(MAX_TOOL_ROUNDS):
             if on_progress:
                 await on_progress("Thinking...")
-            response = await self._with_heartbeat(
-                self._client.chat.completions.create(
-                    model=self._model,
-                    messages=history,
-                    tools=TOOLS,
-                ),
-                on_progress,
-                "Still thinking",
-            )
+            with self._tracer.start_as_current_span(
+                f"chat {self._model}", kind=SpanKind.CLIENT
+            ) as chat_span:
+                chat_span.set_attribute("gen_ai.operation.name", "chat")
+                chat_span.set_attribute("gen_ai.request.model", self._model)
+                chat_span.set_attribute("gen_ai.provider.name", "openai")
+                chat_span.set_attribute("llm.model_name", self._model)
+                chat_span.set_attribute("llm.system", "openai")
+                try:
+                    response = await self._with_heartbeat(
+                        self._client.chat.completions.create(
+                            model=self._model,
+                            messages=history,
+                            tools=TOOLS,
+                        ),
+                        on_progress,
+                        "Still thinking",
+                    )
+                    usage = response.usage
+                    if usage is not None:
+                        chat_span.set_attribute(
+                            "gen_ai.usage.input_tokens", usage.prompt_tokens
+                        )
+                        chat_span.set_attribute(
+                            "gen_ai.usage.output_tokens", usage.completion_tokens
+                        )
+                        chat_span.set_attribute(
+                            "llm.token_count.prompt", usage.prompt_tokens
+                        )
+                        chat_span.set_attribute(
+                            "llm.token_count.completion", usage.completion_tokens
+                        )
+                    finish_reason = response.choices[0].finish_reason
+                    if finish_reason:
+                        chat_span.set_attribute(
+                            "gen_ai.response.finish_reasons", [finish_reason]
+                        )
+                    chat_span.set_status(Status(StatusCode.OK))
+                except Exception as exc:
+                    chat_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                    chat_span.record_exception(exc)
+                    raise
             message = response.choices[0].message
             history.append(message.model_dump(exclude_none=True))
 
@@ -343,41 +378,61 @@ class ReservationAgent:
                         TOOL_PROGRESS.get(tool_call.function.name, "Working on that...")
                     )
                 arguments = json.loads(tool_call.function.arguments or "{}")
-                try:
-                    result = await self._with_heartbeat(
-                        mcp_client.call_tool(
-                            MCP_URL,
+                with self._tracer.start_as_current_span(
+                    f"execute_tool {tool_call.function.name}",
+                    kind=SpanKind.INTERNAL,
+                ) as tool_span:
+                    tool_span.set_attribute("gen_ai.operation.name", "execute_tool")
+                    tool_span.set_attribute("gen_ai.tool.name", tool_call.function.name)
+                    tool_span.set_attribute("openinference.span.kind", "TOOL")
+                    tool_span.set_attribute("input.value", json.dumps(arguments))
+                    try:
+                        result = await self._with_heartbeat(
+                            mcp_client.call_tool(
+                                MCP_URL,
+                                MCP_TOOL_PREFIX + tool_call.function.name,
+                                arguments,
+                                authorization=authorization,
+                            ),
+                            on_progress,
+                            "Still working",
+                        )
+                        logger.info(
+                            "tool %s returned %s",
+                            tool_call.function.name,
+                            _summarize(result),
+                        )
+                        content = json.dumps(result)
+                        tool_span.set_attribute("output.value", content)
+                        tool_span.set_status(Status(StatusCode.OK))
+                    except mcp_client.ToolCallFailed as exc:
+                        # The tool ran and said no: that slot is taken, no such
+                        # reservation, that date is a weekend. The model has a
+                        # real answer to relay, so the turn carries on. That is
+                        # a real tool response, not a span-level failure.
+                        content = json.dumps({"error": str(exc)})
+                        tool_span.set_attribute("output.value", content)
+                        tool_span.set_status(Status(StatusCode.OK))
+                    except Exception as exc:
+                        # The tool did not answer at all - auth, network, the
+                        # gateway, or (per docs/how-to-guides/
+                        # run-the-reimagined-aaa-and-ibac-demo.md) an IBAC
+                        # block. There is nothing here for the model to work
+                        # from, and handing it over invites a confident,
+                        # invented reply, so record it and end the turn
+                        # instead. This is the span Phoenix Trace 5 in that
+                        # guide points at: present, but marked as failed,
+                        # with the tool's own span missing behind it.
+                        logger.warning(
+                            "tool call %s (sent as %s) failed: %s",
+                            tool_call.function.name,
                             MCP_TOOL_PREFIX + tool_call.function.name,
-                            arguments,
-                            authorization=authorization,
-                        ),
-                        on_progress,
-                        "Still working",
-                    )
-                    logger.info(
-                        "tool %s returned %s",
-                        tool_call.function.name,
-                        _summarize(result),
-                    )
-                    content = json.dumps(result)
-                except mcp_client.ToolCallFailed as exc:
-                    # The tool ran and said no: that slot is taken, no such
-                    # reservation, that date is a weekend. The model has a
-                    # real answer to relay, so the turn carries on.
-                    content = json.dumps({"error": str(exc)})
-                except Exception as exc:
-                    # The tool did not answer at all - auth, network, the
-                    # gateway. There is nothing here for the model to work
-                    # from, and handing it over invites a confident, invented
-                    # reply, so record it and end the turn instead.
-                    logger.warning(
-                        "tool call %s (sent as %s) failed: %s",
-                        tool_call.function.name,
-                        MCP_TOOL_PREFIX + tool_call.function.name,
-                        _describe(exc),
-                    )
-                    tool_failure = exc
-                    content = json.dumps({"error": str(exc)})
+                            _describe(exc),
+                        )
+                        tool_failure = exc
+                        content = json.dumps({"error": str(exc)})
+                        tool_span.set_status(Status(StatusCode.ERROR, str(exc)))
+                        tool_span.record_exception(exc)
                 history.append(
                     {
                         "role": "tool",

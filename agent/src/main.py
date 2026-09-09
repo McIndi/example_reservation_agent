@@ -16,7 +16,10 @@ from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
 from starlette.applications import Starlette
 
+from . import tracing
 from .agent_executor import ReservationAgentExecutor
+
+tracing.init_tracing()
 
 PORT = int(os.environ.get("PORT", "8000"))
 # Rossoctl sets AGENT_ENDPOINT on every agent it deploys, to the Service
