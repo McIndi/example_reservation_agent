@@ -47,6 +47,13 @@ LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "90"))
 # default, which is why this is not simply set to a minute.
 HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", "10"))
 
+# Ollama's OpenAI-compatible endpoint defaults to a high temperature when
+# unset, which made tool-call decisions inconsistent run to run on the small
+# CPU-served model this agent talks to by default. A low temperature plus a
+# fixed seed makes rehearsal reproducible instead of different every attempt.
+LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.2"))
+LLM_SEED = int(os.environ.get("LLM_SEED", "42"))
+
 SYSTEM_PROMPT_TEMPLATE = """You are a scheduling assistant. You book 30-minute
 reservations, Monday-Friday, 09:00-17:00. Today's date is {today}.
 
@@ -337,6 +344,8 @@ class ReservationAgent:
                             model=self._model,
                             messages=history,
                             tools=TOOLS,
+                            temperature=LLM_TEMPERATURE,
+                            seed=LLM_SEED,
                         ),
                         on_progress,
                         "Still thinking",
