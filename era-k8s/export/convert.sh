@@ -1,14 +1,21 @@
 #!/bin/zsh
-# convert.sh INSTANCE [qcow2|vmdk|vdi|vhdx] -- convert a STOPPED Lima instance's raw disk into a portable
-# image under ~/Documents/era-k8s/export/out/. qemu-img is not available for Intel macOS, so it runs inside
-# the `podman` Lima VM, which sees the same paths through its home mount.
+# convert.sh INSTANCE|DISKFILE [qcow2|vmdk|vdi|vhdx] [OUT] -- convert a STOPPED Lima instance's raw disk, or any
+# disk image under $HOME (raw, vdi, vmdk...), into a portable image, by default under ~/Documents/era-k8s/export/out/.
+# qemu-img is not available for Intel macOS, so it runs inside the `podman` Lima VM, which sees the same paths
+# through its home mount.
 set -euo pipefail
 inst="${1:-}"; fmt="${2:-qcow2}"
-[[ -n "$inst" ]] || { print -u2 "usage: convert.sh INSTANCE [qcow2|vmdk|vdi|vhdx]"; exit 1; }
-src="$HOME/.lima/$inst/disk"; [[ -f "$src" ]] || { print -u2 "no disk at $src"; exit 1; }
-st=$(limactl list "$inst" --format '{{.Status}}'); [[ "$st" == "Stopped" ]] || { print -u2 "$inst is $st; stop it first"; exit 1; }
+[[ -n "$inst" ]] || { print -u2 "usage: convert.sh INSTANCE|DISKFILE [qcow2|vmdk|vdi|vhdx] [OUT]"; exit 1; }
+if [[ -f "$inst" ]]; then
+  src="${inst:A}"; name="${${src:t}%.*}"
+else
+  src="$HOME/.lima/$inst/disk"; [[ -f "$src" ]] || { print -u2 "no disk at $src"; exit 1; }
+  st=$(limactl list "$inst" --format '{{.Status}}'); [[ "$st" == "Stopped" ]] || { print -u2 "$inst is $st; stop it first"; exit 1; }
+  name="${inst}-$(date +%Y%m%d)"
+fi
 [[ "$(limactl list podman --format '{{.Status}}')" == "Running" ]] || limactl start podman --tty=false
-out="$HOME/Documents/era-k8s/export/out/${inst}-$(date +%Y%m%d).${fmt}"
+out="${3:-$HOME/Documents/era-k8s/export/out/${name}.${fmt}}"
+mkdir -p "${out:h}"
 limactl shell podman -- sudo dnf -y -q install qemu-img >/dev/null
 case "$fmt" in
   qcow2) opts=(-c) ;;                       # compressed

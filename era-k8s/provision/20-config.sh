@@ -41,3 +41,13 @@ ERA_BRANCH=era-k8s
 ERA_REPO_SUBDIR=era-k8s
 EOF
 chmod 0644 /etc/era-k8s/config.env
+
+# Console login banner (agetty's /etc/issue escapes): the address to reach the VM by and how to log in, for images
+# run outside Vagrant or Lima, where nothing else tells the recipient. \4 = the IPv4 of the first routable interface.
+mkdir -p /etc/issue.d
+cat <<'EOF2' >/etc/issue.d/era-k8s.issue
+era-k8s  address: \4  (ssh vagrant@\4, password vagrant; then: sudo era verify, sudo era all)
+URLs after `era all` use https://<service>.localtest.me:8443 through port forwards, or set the domain to this
+address first: sudo era config ERA_DOMAIN=<a-b-c-d>.sslip.io (dashes for dots)
+
+EOF2

@@ -1,5 +1,6 @@
 # built or secret things never go in git
 export/out/
+shared/cache/
 *.disk
 .DS_Store
 .vagrant/

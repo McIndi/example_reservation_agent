@@ -1,11 +1,13 @@
-# era-k8s Vagrant boxes: the same provisioning as the Lima template (provision/*.sh), as a pre-init image
-# that initializes its cluster at the first `vagrant up`. One build, two providers:
+# era-k8s images for x86_64: the same provisioning as the Lima template (provision/*.sh), as a pre-init
+# image that initializes its cluster at the recipient's first boot. One build per hypervisor, several forms:
 #   packer init era-k8s.pkr.hcl
-#   packer build -only='*.vmware'      era-k8s.pkr.hcl   # output/era-k8s-vmware.box      (Fusion, Workstation)
-#   packer build -only='*.virtualbox'  era-k8s.pkr.hcl   # output/era-k8s-virtualbox.box
+#   ./build.sh vmware        # output/era-k8s-vmware.box (Vagrant), output-vmware/ kept for the OVA
+#   ./build.sh virtualbox    # output/era-k8s-virtualbox.box (Vagrant), output-virtualbox/era-k8s.ova kept
+#   ./build.sh               # both, then the OVAs and the qcow2 (see build.sh)
 # Both boot the Fedora 44 Server netinst ISO (isos/, a symlink to the download), install unattended via
 # http/ks.cfg, run scripts/vagrant-user.sh, upload provision/ ansible/ bin/era export/sanitize-guest.sh,
-# run scripts/provision.sh (ERA_KUBEADM_INIT=false) and scripts/finish.sh, then package the box.
+# run scripts/provision.sh (ERA_KUBEADM_INIT=false) and scripts/finish.sh, then package the box and keep
+# the hypervisor's own VM (output-*/) for build.sh to turn into an OVA and a qcow2.
 packer {
   required_version = ">= 1.11.0"
   required_plugins {
@@ -109,6 +111,16 @@ source "virtualbox-iso" "virtualbox" {
   disk_size            = var.disk_size
   guest_additions_mode = "disable" # no synced folders needed; the Vagrantfile disables /vagrant
   output_directory     = "${path.root}/output-virtualbox"
+  format               = "ova" # one file for "Import Appliance"; the vagrant post-processor unpacks it for the box
+  # Baked into the OVA (VirtualBox keeps its machine settings in the OVF): NAT port forwards for the platform's
+  # URLs on 127.0.0.1, and localhost reachable from the guest. Vagrant clears and re-creates them at `vagrant up`.
+  vboxmanage_post = [
+    ["modifyvm", "{{ .Name }}", "--nat-localhostreachable1", "on"],
+    ["modifyvm", "{{ .Name }}", "--natpf1", "era-https,tcp,127.0.0.1,8443,,8443"],
+    ["modifyvm", "{{ .Name }}", "--natpf1", "era-http,tcp,127.0.0.1,8080,,8080"],
+    ["modifyvm", "{{ .Name }}", "--natpf1", "era-api,tcp,127.0.0.1,6443,,6443"],
+    ["modifyvm", "{{ .Name }}", "--natpf1", "era-ssh,tcp,127.0.0.1,2222,,22"],
+  ]
 }
 
 build {
@@ -148,6 +160,6 @@ build {
   }
   post-processor "vagrant" {
     output              = "${path.root}/output/era-k8s-{{ .Provider }}.box"
-    keep_input_artifact = false
+    keep_input_artifact = true # output-vmware/ (vmx + vmdk) and output-virtualbox/era-k8s.ova: build.sh's inputs
   }
 }

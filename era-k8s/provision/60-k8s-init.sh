@@ -81,7 +81,12 @@ if ! kubectl get installation default >/dev/null 2>&1; then
   kubectl get deploy tigera-operator -n tigera-operator >/dev/null 2>&1 || \
     kubectl create -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO}/manifests/tigera-operator.yaml"
   for i in $(seq 1 120); do kubectl get crd installations.operator.tigera.io >/dev/null 2>&1 && break; sleep 3; done
-  kubectl wait --for=condition=established --timeout=180s crd/installations.operator.tigera.io
+  # Between the CRD's creation and its first status update `kubectl wait` errors out instead of waiting
+  # (".status.conditions accessor error: <nil>"); seen on a slow machine (QEMU without KVM, 2026-10-18). Retry.
+  for i in $(seq 1 60); do
+    kubectl wait --for=condition=established --timeout=180s crd/installations.operator.tigera.io 2>/dev/null && break
+    sleep 3
+  done
   kubectl -n tigera-operator rollout status deploy/tigera-operator --timeout=300s
   cat <<EOF >/etc/calico-installation.yaml
 apiVersion: operator.tigera.io/v1

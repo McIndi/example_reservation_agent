@@ -10,6 +10,7 @@ test -e /etc/kubernetes/admin.conf && { echo "this image already has a cluster; 
 # Lima leftovers
 systemctl disable --now lima-guestagent.service 2>/dev/null || true
 rm -f /etc/systemd/system/lima-guestagent.service /usr/local/bin/lima-guestagent
+umount /mnt/lima-cidata 2>/dev/null || true   # Lima 2.x keeps its cidata ISO mounted there, read-only
 rm -rf /etc/systemd/system/lima-*.service.d /mnt/lima-cidata
 # The Lima login user keeps its account (it cannot delete itself from inside) but loses every credential.
 # KEEP_USER (the Packer boxes set it to `vagrant`) keeps its key and stays unlocked: sshd refuses key logins

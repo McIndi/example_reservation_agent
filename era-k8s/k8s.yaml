@@ -218,6 +218,16 @@ provision:  # filled from provision/*.sh by bin/render-template; do not add entr
     ERA_REPO_SUBDIR=era-k8s
     EOF
     chmod 0644 /etc/era-k8s/config.env
+
+    # Console login banner (agetty's /etc/issue escapes): the address to reach the VM by and how to log in, for images
+    # run outside Vagrant or Lima, where nothing else tells the recipient. \4 = the IPv4 of the first routable interface.
+    mkdir -p /etc/issue.d
+    cat <<'EOF2' >/etc/issue.d/era-k8s.issue
+    era-k8s  address: \4  (ssh vagrant@\4, password vagrant; then: sudo era verify, sudo era all)
+    URLs after `era all` use https://<service>.localtest.me:8443 through port forwards, or set the domain to this
+    address first: sudo era config ERA_DOMAIN=<a-b-c-d>.sslip.io (dashes for dots)
+
+    EOF2
 - mode: system
   script: |
     #!/bin/bash
@@ -405,7 +415,12 @@ provision:  # filled from provision/*.sh by bin/render-template; do not add entr
       kubectl get deploy tigera-operator -n tigera-operator >/dev/null 2>&1 || \
         kubectl create -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO}/manifests/tigera-operator.yaml"
       for i in $(seq 1 120); do kubectl get crd installations.operator.tigera.io >/dev/null 2>&1 && break; sleep 3; done
-      kubectl wait --for=condition=established --timeout=180s crd/installations.operator.tigera.io
+      # Between the CRD's creation and its first status update `kubectl wait` errors out instead of waiting
+      # (".status.conditions accessor error: <nil>"); seen on a slow machine (QEMU without KVM, 2026-10-18). Retry.
+      for i in $(seq 1 60); do
+        kubectl wait --for=condition=established --timeout=180s crd/installations.operator.tigera.io 2>/dev/null && break
+        sleep 3
+      done
       kubectl -n tigera-operator rollout status deploy/tigera-operator --timeout=300s
       cat <<EOF >/etc/calico-installation.yaml
     apiVersion: operator.tigera.io/v1

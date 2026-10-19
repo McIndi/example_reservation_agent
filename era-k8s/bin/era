@@ -9,7 +9,7 @@
 #   era all        verify, platform, agent, vault, siematic in that order; stops at the first failure
 #   era update     refresh /opt/era-k8s from the repo named in /etc/era-k8s/config.env (ERA_REPO, ERA_BRANCH)
 #   era mesh-recover  re-enroll pre-mesh pods after a restart (also runs at boot)
-#   era config     show /etc/era-k8s/config.env
+#   era config     show /etc/era-k8s/config.env; `era config KEY=VALUE ...` sets values in it (before era platform)
 set -euo pipefail
 ROOT=/opt/era-k8s
 [ "$(id -u)" = 0 ] || exec sudo -E "$0" "$@"
@@ -26,6 +26,11 @@ case "$cmd" in
             if [ -d "$ROOT/.git" ]; then git -C "$ROOT" pull --ff-only; else tmp=$(mktemp -d); git clone --branch "${ERA_BRANCH:-main}" "$ERA_REPO" "$tmp/repo" && rsync -a --delete --exclude .git --exclude example_reservation_agent --exclude siematic "$tmp/repo/${ERA_REPO_SUBDIR:-.}/" "$ROOT/"; rm -rf "$tmp"; fi
             echo "era: $ROOT updated" ;;
   mesh-recover) exec /usr/local/sbin/era-mesh-recover.sh ;;
-  config)   cat /etc/era-k8s/config.env ;;
+  config)   [ $# -eq 0 ] && { cat /etc/era-k8s/config.env; exit 0; }
+            for kv in "$@"; do
+              k="${kv%%=*}"; v="${kv#*=}"
+              [[ "$k" =~ ^ERA_[A-Z0-9_]+$ ]] || { echo "era config: expected ERA_KEY=value, got '$kv'" >&2; exit 1; }
+              if grep -q "^${k}=" /etc/era-k8s/config.env; then sed -i "s|^${k}=.*|${k}=${v}|" /etc/era-k8s/config.env; else echo "${k}=${v}" >>/etc/era-k8s/config.env; fi
+            done; grep -E "^($(printf '%s\n' "$@" | cut -d= -f1 | paste -sd'|' -))=" /etc/era-k8s/config.env ;;
   *)        sed -n '2,10p' "$0"; exit 1 ;;
 esac
