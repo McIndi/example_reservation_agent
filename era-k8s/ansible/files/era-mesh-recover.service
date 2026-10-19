@@ -1,0 +1,14 @@
+[Unit]
+Description=era-k8s: re-enroll pre-mesh pods in the Istio ambient mesh after boot
+After=network-online.target kubelet.service crio.service
+Wants=network-online.target
+ConditionPathExists=/etc/kubernetes/admin.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/era-mesh-recover.sh
+TimeoutStartSec=20min
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

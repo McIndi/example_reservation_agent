@@ -1,0 +1,548 @@
+---
+# era platform: install the rossoctl platform the example_reservation_agent way, on this cluster.
+# Reproduces the order, versions and flags of rossoctl's installer (scripts/kind/setup-rossoctl.sh at
+# rossoctl_version, components: istio ambient, spire, backend+ui, mcp-gateway, otel; no builds, no
+# examples, no kuadrant) plus Arize Phoenix for traces (the demo's "AFTER" evidence), plus an in-cluster Ollama. With ERA_TLS=true (the default) a local CA from
+# cert-manager signs a wildcard certificate for the domain, the gateway gets an HTTPS listener on
+# NodePort 30443 (host port 8443), and every public URL is https://<name>.<domain>:8443.
+# Runs inside the VM as root. Idempotent: every step is an upgrade --install or an apply.
+- name: Install the rossoctl platform
+  hosts: cluster
+  become: true
+  gather_facts: false
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+    PATH: /usr/local/bin:/usr/bin:/bin
+  vars:
+    rossoctl_version: v0.7.0            # the primary demo cluster's version until told otherwise
+    rossoctl_repo: https://github.com/rossoctl/rossoctl.git
+    rossoctl_dir: /opt/era-k8s/rossoctl
+    cert_manager_version: v1.17.2
+    istio_version: "1.28.0"
+    spire_crd_version: "0.5.0"
+    spire_version: "0.27.0"
+    spiffe_csi_driver_version: "0.2.13"
+    gateway_api_version: v1.4.0
+    mcp_gateway_version: "0.6.0"
+    with_kuadrant: false
+    secrets_file: /etc/era-k8s/secrets.yaml   # helm values: secrets.githubToken etc. (0600, never in git)
+    # laptop-suspend fix from rossoctl 0.8 (two SPIRE TTLs), applied to 0.7.0
+    spire_suspend_fix: true
+    ollama_namespace: ollama
+    ollama_image: docker.io/ollama/ollama:0.11.10
+    ollama_storage: 10Gi
+  tasks:
+    - name: Read /etc/era-k8s/config.env
+      ansible.builtin.shell: set -a; . /etc/era-k8s/config.env; env | grep '^ERA_'
+      register: era_env
+      changed_when: false
+    - name: Expose ERA_* as facts
+      ansible.builtin.set_fact:
+        era: "{{ dict(era_env.stdout_lines | map('regex_replace', '^ERA_([^=]+)=(.*)$', '\\1=\\2') | map('split', '=', 1)) }}"
+    - name: URL scheme and port from ERA_TLS
+      ansible.builtin.set_fact:
+        url_scheme: "{{ 'https' if (era.TLS | lower) == 'true' else 'http' }}"
+        url_port: "{{ '8443' if (era.TLS | lower) == 'true' else '8080' }}"
+        tls: "{{ (era.TLS | lower) == 'true' }}"
+    - name: Settings in use
+      ansible.builtin.debug:
+        msg: "domain={{ era.DOMAIN }} llm={{ era.LLM_PROVIDER }} ({{ era.LLM_API_BASE }}, {{ era.LLM_MODEL }}) tls={{ era.TLS }} rossoctl={{ rossoctl_version }}"
+    - name: Preflight
+      ansible.builtin.shell: |
+        set -e
+        helm version --short | grep -q '^v3\.' || { echo "helm 3 required"; exit 1; }
+        kubectl get nodes >/dev/null
+        kubectl get storageclass local-path >/dev/null
+      changed_when: false
+
+    # ---- source checkout ------------------------------------------------------------------------
+    - name: rossoctl charts at {{ rossoctl_version }}
+      ansible.builtin.git:
+        repo: "{{ rossoctl_repo }}"
+        dest: "{{ rossoctl_dir }}"
+        version: "{{ rossoctl_version }}"
+        depth: 1
+        single_branch: true
+    - name: Secrets values file (empty template unless Brian filled it)
+      ansible.builtin.copy:
+        src: "{{ rossoctl_dir }}/charts/rossoctl/.secrets_template.yaml"
+        dest: "{{ secrets_file }}"
+        remote_src: true
+        force: false
+        mode: "0600"
+
+    # ---- step 2: cert-manager --------------------------------------------------------------------
+    - name: cert-manager {{ cert_manager_version }}
+      ansible.builtin.shell: |
+        set -e
+        kubectl get deployment cert-manager-webhook -n cert-manager >/dev/null 2>&1 && exit 0
+        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/{{ cert_manager_version }}/cert-manager.yaml
+        kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=300s
+      register: r
+      changed_when: "'created' in r.stdout"
+
+    # ---- TLS: local CA (ClusterIssuer era-ca) ------------------------------------------------------
+    - name: Local CA and ClusterIssuer era-ca
+      when: tls
+      ansible.builtin.shell: |
+        set -e
+        kubectl apply -f - <<EOF2
+        apiVersion: cert-manager.io/v1
+        kind: ClusterIssuer
+        metadata: {name: era-selfsigned}
+        spec: {selfSigned: {}}
+        ---
+        apiVersion: cert-manager.io/v1
+        kind: Certificate
+        metadata: {name: era-ca, namespace: cert-manager}
+        spec:
+          isCA: true
+          commonName: "era-k8s local CA ({{ era.DOMAIN }})"
+          secretName: era-ca
+          duration: 87600h
+          privateKey: {algorithm: ECDSA, size: 256}
+          issuerRef: {name: era-selfsigned, kind: ClusterIssuer, group: cert-manager.io}
+        ---
+        apiVersion: cert-manager.io/v1
+        kind: ClusterIssuer
+        metadata: {name: era-ca}
+        spec: {ca: {secretName: era-ca}}
+        EOF2
+        kubectl wait --for=condition=Ready certificate/era-ca -n cert-manager --timeout=120s
+        mkdir -p /etc/era-k8s
+        kubectl get secret era-ca -n cert-manager -o jsonpath='{.data.ca\.crt}' | base64 -d >/etc/era-k8s/era-ca.crt
+        install -m 0644 /etc/era-k8s/era-ca.crt /etc/pki/ca-trust/source/anchors/era-ca.crt && update-ca-trust
+        [ -d /vagrant/cache ] && cp /etc/era-k8s/era-ca.crt /vagrant/cache/era-ca.crt || true
+        echo "CA at /etc/era-k8s/era-ca.crt (trusted in this VM; trust it on the Mac: security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db era-ca.crt)"
+      register: r
+      changed_when: true
+
+    # ---- step 3/3a: Istio with the ambient mesh --------------------------------------------------
+    # SELinux enforcing: the CNI node agent and ztunnel bind sockets on host paths; without the
+    # spc_t type they are denied (first run 2026-10-17: istio-cni-node CrashLoopBackOff). Same
+    # setting Istio's OpenShift profile uses.
+    - name: Istio {{ istio_version }} base, istiod (ambient), cni, ztunnel
+      ansible.builtin.shell: |
+        set -e
+        REPO=https://istio-release.storage.googleapis.com/charts/
+        kubectl delete validatingwebhookconfiguration istiod-default-validator --ignore-not-found
+        helm upgrade --install istio-base base --repo $REPO --version {{ istio_version }} -n istio-system --create-namespace --wait
+        kubectl delete validatingwebhookconfiguration istio-validator-istio-system --ignore-not-found
+        helm upgrade --install istiod istiod --repo $REPO --version {{ istio_version }} -n istio-system --wait --set profile=ambient
+        helm upgrade --install istio-cni cni --repo $REPO --version {{ istio_version }} -n istio-system --wait --set profile=ambient --set cni.seLinuxOptions.type=spc_t --set cni.ambient.reconcileIptablesOnStartup=true
+        helm upgrade --install ztunnel ztunnel --repo $REPO --version {{ istio_version }} -n istio-system --wait --set seLinuxOptions.type=spc_t
+        kubectl label namespace istio-system shared-gateway-access=true --overwrite
+      changed_when: true
+
+    # ---- step 5: Gateway API CRDs ----------------------------------------------------------------
+    - name: Gateway API {{ gateway_api_version }}
+      ansible.builtin.shell: |
+        set -e
+        kubectl get crd gateways.gateway.networking.k8s.io >/dev/null 2>&1 && exit 0
+        kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/{{ gateway_api_version }}/standard-install.yaml
+        kubectl wait --for=condition=Established --timeout=60s crd/httproutes.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io
+      register: r
+      changed_when: "'created' in r.stdout"
+
+    # ---- step 4: SPIRE ---------------------------------------------------------------------------
+    - name: SPIRE {{ spire_version }} (crds {{ spire_crd_version }})
+      ansible.builtin.shell: |
+        set -e
+        REPO=https://spiffe.github.io/helm-charts-hardened/
+        helm upgrade --install spire-crds spire-crds --repo $REPO --version {{ spire_crd_version }} -n spire-mgmt --create-namespace --wait
+        kubectl delete configmap spire-spiffe-oidc-discovery-provider -n zero-trust-workload-identity-manager --ignore-not-found
+        helm upgrade --install spire spire --repo $REPO --version {{ spire_version }} -n spire-mgmt --create-namespace \
+          --set global.spire.recommendations.enabled=true \
+          --set global.spire.namespaces.create=true \
+          --set global.spire.namespaces.server.name=zero-trust-workload-identity-manager \
+          --set global.spire.namespaces.server.create=true \
+          --set-string "global.spire.namespaces.server.labels.shared-gateway-access=true" \
+          --set global.spire.ingressControllerType="" \
+          --set global.spire.clusterName=agent-platform \
+          --set-string "spiffe-csi-driver.image.tag={{ spiffe_csi_driver_version }}" \
+          --set "global.spire.trustDomain={{ era.DOMAIN }}" \
+          --set "global.spire.caSubject.country=US" \
+          --set "global.spire.caSubject.organization=AgenticPlatformDemo" \
+          --set "global.spire.caSubject.commonName={{ era.DOMAIN }}" \
+          --set spire-server.tornjak.enabled=true \
+          --set "spire-server.controllerManager.ignoreNamespaces={kube-system,kube-public}" \
+          --set spire-server.controllerManager.identities.clusterSPIFFEIDs.default.autoPopulateDNSNames=true \
+          --set spire-server.controllerManager.identities.clusterSPIFFEIDs.default.jwtTTL=5m \
+          {% if spire_suspend_fix %}--set spire-server.controllerManager.identities.clusterSPIFFEIDs.default.ttl=24h --set spire-server.caTTL=168h{% endif %} \
+          --set spiffe-oidc-discovery-provider.enabled=true \
+          --set spiffe-oidc-discovery-provider.config.set_key_use=true \
+          --set spiffe-oidc-discovery-provider.tls.spire.enabled=false \
+          --set tornjak-frontend.enabled=true \
+          --set tornjak-frontend.image.tag=v2.0.0 \
+          --set tornjak-frontend.ingress.enabled=true \
+          --set "tornjak-frontend.apiServerURL={{ url_scheme }}://spire-tornjak-ui.{{ era.DOMAIN }}:{{ url_port }}" \
+          --set tornjak-frontend.service.type=ClusterIP \
+          --set tornjak-frontend.service.port=3000
+        for i in $(seq 1 60); do kubectl get pod --no-headers -l app.kubernetes.io/instance=spire -n zero-trust-workload-identity-manager 2>/dev/null | grep -q . && break; sleep 2; done
+        kubectl wait --for=condition=Ready pod -l app.kubernetes.io/instance=spire -n zero-trust-workload-identity-manager --timeout=300s
+      changed_when: true
+
+    # ---- step 6: rossoctl-deps -------------------------------------------------------------------
+    - name: rossoctl-deps (Keycloak, otel, metrics-server, ingress gateway, MCP inspector)
+      ansible.builtin.shell: |
+        set -e
+        helm upgrade --install rossoctl-deps {{ rossoctl_dir }}/charts/rossoctl-deps/ -n rossoctl-system --create-namespace --wait --timeout 20m --skip-crds \
+          --set openshift=false --set "domain={{ era.DOMAIN }}" \
+          --set "keycloak.publicUrl={{ url_scheme }}://keycloak.{{ era.DOMAIN }}:{{ url_port }}" \
+          --set components.keycloak.enabled=true --set components.certManager.enabled=false \
+          --set components.istio.enabled=false --set components.spire.enabled=true \
+          --set components.otel.enabled=true --set components.metricsServer.enabled=true \
+          --set components.phoenix.enabled=true \
+          --set components.containerRegistry.enabled=true \
+          --set components.ingressGateway.enabled=true --set components.mcpInspector.enabled=true \
+          --set components.tekton.enabled=false --set components.shipwright.enabled=false \
+          --set components.kiali.enabled=false --set components.mlflow.enabled=false --set mlflow.auth.enabled=false \
+          --set components.rhoai.enabled=false
+        kubectl label namespace rossoctl-system shared-gateway-access=true --overwrite
+      changed_when: true
+
+    # ---- TLS: HTTPS listener on the shared gateway (NodePort 30443) ------------------------------
+    - name: Wildcard certificate and HTTPS listener on gateway rossoctl-system/http
+      when: tls
+      ansible.builtin.shell: |
+        set -e
+        kubectl apply -f - <<EOF2
+        apiVersion: cert-manager.io/v1
+        kind: Certificate
+        metadata: {name: era-gateway, namespace: rossoctl-system}
+        spec:
+          secretName: era-gateway-tls
+          dnsNames: ["*.{{ era.DOMAIN }}", "{{ era.DOMAIN }}"]
+          duration: 8760h
+          issuerRef: {name: era-ca, kind: ClusterIssuer, group: cert-manager.io}
+        EOF2
+        kubectl wait --for=condition=Ready certificate/era-gateway -n rossoctl-system --timeout=120s
+        if ! kubectl get gateway http -n rossoctl-system -o jsonpath='{.spec.listeners[*].name}' | grep -qw https; then
+          kubectl patch gateway http -n rossoctl-system --type=json -p '[{"op":"add","path":"/spec/listeners/-","value":{"name":"https","port":443,"protocol":"HTTPS","tls":{"mode":"Terminate","certificateRefs":[{"kind":"Secret","name":"era-gateway-tls"}]},"allowedRoutes":{"namespaces":{"from":"Selector","selector":{"matchLabels":{"shared-gateway-access":"true"}}}}}}]'
+        fi
+        if ! kubectl get svc http-istio-np -n rossoctl-system -o jsonpath='{.spec.ports[*].name}' | grep -qw https; then
+          kubectl patch svc http-istio-np -n rossoctl-system --type=json -p '[{"op":"add","path":"/spec/ports/-","value":{"name":"https","port":443,"targetPort":443,"nodePort":30443,"protocol":"TCP"}}]'
+        fi
+        kubectl wait --for=condition=Programmed gateway/http -n rossoctl-system --timeout=120s
+      changed_when: true
+
+    # ---- step 7: SPIRE post-install (OIDC set_key_use, SPIFFE IdP in Keycloak) --------------------
+    - name: SPIRE OIDC set_key_use patch
+      ansible.builtin.shell: |
+        set -e
+        NS=zero-trust-workload-identity-manager
+        kubectl wait --for=condition=Available deployment/spire-spiffe-oidc-discovery-provider -n $NS --timeout=300s
+        CONF=$(kubectl get configmap spire-spiffe-oidc-discovery-provider -n $NS -o jsonpath='{.data.oidc-discovery-provider\.conf}')
+        if echo "$CONF" | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin).get('set_key_use') else 1)"; then echo unchanged; exit 0; fi
+        kubectl get configmap spire-spiffe-oidc-discovery-provider -n $NS -o json | python3 -c '
+        import sys, json
+        cm = json.load(sys.stdin); d = json.loads(cm["data"]["oidc-discovery-provider.conf"]); d["set_key_use"] = True
+        cm["data"]["oidc-discovery-provider.conf"] = json.dumps(d); json.dump(cm, sys.stdout)' | kubectl apply -f -
+        kubectl rollout restart deployment/spire-spiffe-oidc-discovery-provider -n $NS
+        kubectl rollout status deployment/spire-spiffe-oidc-discovery-provider -n $NS --timeout=120s
+      register: r
+      changed_when: "'unchanged' not in r.stdout"
+    - name: SPIFFE IdP setup job (Keycloak trusts SPIRE)
+      ansible.builtin.shell: |
+        set -e
+        NS=rossoctl-system; SNS=zero-trust-workload-identity-manager; KNS=keycloak
+        VALUES=$(helm get values rossoctl-deps -n $NS --all -o json)
+        get() { echo "$VALUES" | python3 -c "import sys,json; v=json.load(sys.stdin); print(eval('v$1'))"; }
+        KC_URL=$(get '["keycloak"]["url"]'); KC_REALM=$(get '["keycloak"]["realm"]'); KC_ADMIN_SECRET=$(get '["keycloak"]["adminSecretName"]')
+        IDP_IMAGE="$(get '["spiffeIdp"]["image"]["repository"]'):$(get '["spiffeIdp"]["image"]["tag"]')"
+        KUBECTL_IMAGE=$(get '["common"]["kubectlImage"]'); IDP_ALIAS=$(get '["authBridge"]["spiffeIdpAlias"]' 2>/dev/null || echo spire-spiffe)
+        kubectl apply -f - <<EOF2
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: rossoctl-spiffe-idp-setup, namespace: $NS}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata: {name: rossoctl-spiffe-idp-reader}
+        rules: [{apiGroups: [""], resources: [secrets], resourceNames: [$KC_ADMIN_SECRET], verbs: [get]}]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: rossoctl-spiffe-idp-keycloak-reader, namespace: $KNS}
+        subjects: [{kind: ServiceAccount, name: rossoctl-spiffe-idp-setup, namespace: $NS}]
+        roleRef: {kind: ClusterRole, name: rossoctl-spiffe-idp-reader, apiGroup: rbac.authorization.k8s.io}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: rossoctl-spiffe-idp-pod-reader, namespace: $SNS}
+        rules: [{apiGroups: [""], resources: [pods], verbs: [get, list, watch]}]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: rossoctl-spiffe-idp-pod-reader, namespace: $SNS}
+        subjects: [{kind: ServiceAccount, name: rossoctl-spiffe-idp-setup, namespace: $NS}]
+        roleRef: {kind: Role, name: rossoctl-spiffe-idp-pod-reader, apiGroup: rbac.authorization.k8s.io}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata: {name: rossoctl-spiffe-idp-pod-reader, namespace: $KNS}
+        rules: [{apiGroups: [""], resources: [pods], verbs: [get, list, watch]}]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata: {name: rossoctl-spiffe-idp-pod-reader, namespace: $KNS}
+        subjects: [{kind: ServiceAccount, name: rossoctl-spiffe-idp-setup, namespace: $NS}]
+        roleRef: {kind: Role, name: rossoctl-spiffe-idp-pod-reader, apiGroup: rbac.authorization.k8s.io}
+        EOF2
+        if kubectl get job rossoctl-spiffe-idp-setup-job -n $NS -o jsonpath='{.status.succeeded}' 2>/dev/null | grep -q 1; then echo "job already complete"; exit 0; fi
+        kubectl delete job rossoctl-spiffe-idp-setup-job -n $NS --ignore-not-found
+        kubectl apply -f - <<EOF2
+        apiVersion: batch/v1
+        kind: Job
+        metadata: {name: rossoctl-spiffe-idp-setup-job, namespace: $NS}
+        spec:
+          backoffLimit: 10
+          template:
+            metadata: {labels: {app: rossoctl-spiffe-idp-setup}}
+            spec:
+              serviceAccountName: rossoctl-spiffe-idp-setup
+              restartPolicy: OnFailure
+              initContainers:
+              - name: wait-for-dependencies
+                image: "$KUBECTL_IMAGE"
+                command: [sh, -c]
+                args:
+                - |
+                  set -e
+                  kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=server -n $SNS --timeout=300s
+                  kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=spiffe-oidc-discovery-provider -n $SNS --timeout=300s
+                  kubectl wait --for=condition=ready pod -l app=keycloak -n $KNS --timeout=300s
+                  for i in \$(seq 1 60); do curl -sf http://spire-spiffe-oidc-discovery-provider.$SNS.svc.cluster.local/keys | grep -q '"use"' && exit 0; sleep 5; done
+                  exit 1
+              containers:
+              - name: setup-spiffe-idp
+                image: "$IDP_IMAGE"
+                env:
+                - {name: KEYCLOAK_BASE_URL, value: "$KC_URL"}
+                - {name: KEYCLOAK_REALM, value: "$KC_REALM"}
+                - {name: KEYCLOAK_NAMESPACE, value: "$KNS"}
+                - {name: KEYCLOAK_ADMIN_SECRET_NAME, value: "$KC_ADMIN_SECRET"}
+                - {name: KEYCLOAK_ADMIN_USERNAME_KEY, value: "username"}
+                - {name: KEYCLOAK_ADMIN_PASSWORD_KEY, value: "password"}
+                - {name: SPIFFE_TRUST_DOMAIN, value: "spiffe://{{ era.DOMAIN }}"}
+                - {name: SPIFFE_BUNDLE_ENDPOINT, value: "http://spire-spiffe-oidc-discovery-provider.$SNS.svc.cluster.local/keys"}
+                - {name: SPIFFE_IDP_ALIAS, value: "$IDP_ALIAS"}
+        EOF2
+        kubectl wait --for=condition=complete job/rossoctl-spiffe-idp-setup-job -n $NS --timeout=600s
+      args: { executable: /bin/bash }
+      register: r
+      changed_when: "'already complete' not in r.stdout"
+
+    # ---- AuthBridge pipeline with IBAC, as a Helm value (survives upgrades and pod re-renders) --------
+    # The chart's authBridge.pipeline string is rendered into the namespace template
+    # authbridge-runtime-config, which the operator's webhook renders into every workload's config.
+    # A merge into the ConfigMap by hand is undone by the next `helm upgrade` (found 2026-10-17 18:55).
+    - name: Values file with the IBAC chain (a2a-parser inbound; mcp-parser + ibac outbound)
+      ansible.builtin.copy:
+        dest: /etc/era-k8s/rossoctl-ibac-values.yaml
+        mode: "0644"
+        content: |
+          authBridge:
+            pipeline: |
+              inbound:
+                plugins:
+                  - name: a2a-parser
+                  - name: jwt-validation
+                    config:
+                      issuer: "{{ '{{' }} .Values.keycloak.publicUrl {{ '}}' }}/realms/{{ '{{' }} .Values.keycloak.realm {{ '}}' }}"
+                      keycloak_url: "http://keycloak-service.{{ '{{' }} .Values.keycloak.namespace {{ '}}' }}.svc:8080"
+                      keycloak_realm: {{ '{{' }} .Values.keycloak.realm | quote {{ '}}' }}
+              outbound:
+                plugins:
+                  - name: token-exchange
+                    config:
+                      keycloak_url: "http://keycloak-service.{{ '{{' }} .Values.keycloak.namespace {{ '}}' }}.svc:8080"
+                      keycloak_realm: {{ '{{' }} .Values.keycloak.realm | quote {{ '}}' }}
+                      default_policy: "passthrough"
+                      identity:
+                        type: "client-secret"
+                  - name: mcp-parser
+                  - name: ibac
+                    # explicit, as in the primary's ocp-runner/manifests/authbridge-pipeline-ibac.yaml
+                    # (both are the plugin defaults): enforce = a denied action gets 403 ibac.blocked;
+                    # "observe" would log verdicts and let everything through.
+                    on_error: enforce
+                    config:
+                      judge_endpoint: "{{ era.LLM_API_BASE | regex_replace('/v1/?$', '') }}"
+                      judge_model: "{{ era.LLM_MODEL }}"
+                      timeout_ms: 60000
+                      judge_inference: false
+                      agent_llm_host: "{{ era.LLM_API_BASE | regex_replace('^[a-z]+://', '') | regex_replace('[:/].*$', '') }}"
+                      unclassified_policy: "judge"
+                      no_intent_policy: "allow"
+
+    # ---- step 8: rossoctl (operator, backend, UI) ------------------------------------------------
+    - name: rossoctl chart (operator CRDs first, then helm upgrade --install)
+      ansible.builtin.shell: |
+        set -e
+        cd {{ rossoctl_dir }}/charts/rossoctl
+        helm dependency update . >/dev/null
+        CRDS=charts/operator-chart/crds
+        if [ ! -d "$CRDS" ]; then T=$(mktemp -d); tar xzf charts/operator-chart-*.tgz -C "$T"; CRDS="$T/operator-chart/crds"; fi
+        kubectl apply --server-side --force-conflicts -f "$CRDS"
+        kubectl wait --for=condition=Established --timeout=60s -f "$CRDS"
+        for j in rossoctl-ui-oauth-secret-job rossoctl-agent-oauth-secret-job mlflow-oauth-secret-job; do kubectl delete job $j -n rossoctl-system --ignore-not-found; done
+        # The UI OAuth client (redirect URI, web origins) is generated from ui.url by a job that only
+        # runs once; if the stored redirect does not match the URL scheme/port in use, regenerate it.
+        WANT="{{ url_scheme }}://rossoctl-ui.{{ era.DOMAIN }}:{{ url_port }}/"
+        HAVE=$(kubectl -n rossoctl-system get secret rossoctl-ui-oauth-secret -o jsonpath='{.data.REDIRECT_URI}' 2>/dev/null | base64 -d || true)
+        if [ -n "$HAVE" ] && [ "$HAVE" != "$WANT" ]; then
+          # once era vault has run, VSO owns this Secret: Vault is the source; change it there, not here
+          if kubectl -n rossoctl-system get vaultstaticsecret rossoctl-ui-oauth-secret >/dev/null 2>&1; then
+            echo "UI redirect $HAVE != $WANT but the Secret is Vault-managed (VaultStaticSecret present): update rossoctl/rossoctl-ui-oauth-secret in Vault instead" >&2
+          else
+            echo "UI redirect $HAVE -> $WANT: regenerating"; kubectl -n rossoctl-system delete secret rossoctl-ui-oauth-secret; REGEN=1
+          fi
+        fi
+        kubectl create namespace mcp-system --dry-run=client -o yaml | kubectl apply -f -
+        helm upgrade --install rossoctl . -n rossoctl-system -f {{ secrets_file }} -f /etc/era-k8s/rossoctl-ibac-values.yaml \
+          --set openshift=false --set "domain={{ era.DOMAIN }}" \
+          --set "keycloak.publicUrl={{ url_scheme }}://keycloak.{{ era.DOMAIN }}:{{ url_port }}" \
+          --set "ui.url={{ url_scheme }}://rossoctl-ui.{{ era.DOMAIN }}:{{ url_port }}" \
+          --set "mlflow.url={{ url_scheme }}://mlflow.{{ era.DOMAIN }}:{{ url_port }}" \
+          --set components.agentNamespaces.enabled=true --set components.agentOperator.enabled=true \
+          --set components.ui.enabled=true --set ui.frontend.enabled=true \
+          --set components.istio.enabled=true --set components.mcpGateway.enabled=true \
+          --set featureFlags.agentSandbox=false --set featureFlags.skills=false --set featureFlags.externalSkills=false \
+          --set featureFlags.simulatedTools=false --set components.skillberryStore.enabled=false \
+          --set components.mlflow.enabled=false --set ui.auth.enabled=true --set mlflow.auth.enabled=false \
+          --set operator-chart.featureGates.injectTools=true \
+          --set operator-chart.kuadrant.enable={{ with_kuadrant | lower }} \
+          --set operator-chart.spiffe.enabled=false --set operator-chart.spiffe.operatorAuth.enabled=false \
+          --set "operator-chart.keycloak.publicUrl={{ url_scheme }}://keycloak.{{ era.DOMAIN }}:{{ url_port }}" \
+          --set authBridge.clientAuthType=client-secret --set spire.enabled=true
+        for i in $(seq 1 60); do kubectl get pod --no-headers -l app.kubernetes.io/name=operator-chart -n rossoctl-system 2>/dev/null | grep -q . && break; sleep 2; done
+        kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=operator-chart -n rossoctl-system --timeout=300s
+        if [ -n "${REGEN:-}" ]; then
+          kubectl -n rossoctl-system wait --for=condition=complete job/rossoctl-ui-oauth-secret-job --timeout=300s
+          kubectl -n rossoctl-system rollout restart deploy/rossoctl-ui && kubectl -n rossoctl-system rollout status deploy/rossoctl-ui --timeout=300s
+        fi
+      changed_when: true
+
+    - name: UI config under TLS (the chart hardcodes http://...:8080 for the API and dashboard links)
+      when: tls
+      ansible.builtin.shell: |
+        set -e
+        D="{{ era.DOMAIN }}"; P="{{ url_port }}"
+        kubectl -n rossoctl-system patch configmap rossoctl-ui-config --type=merge -p "{\"data\":{
+          \"API_URL\":\"https://rossoctl-api.$D:$P\",
+          \"MCP_INSPECTOR_URL\":\"https://mcp-inspector.$D:$P\",
+          \"MCP_PROXY_FULL_ADDRESS\":\"https://mcp-inspector.$D:$P/mcp-proxy\",
+          \"KEYCLOAK_CONSOLE_URL\":\"https://keycloak.$D:$P/admin/rossoctl/console/\",
+          \"TRACES_DASHBOARD_URL\":\"https://phoenix.$D:$P\",
+          \"NETWORK_TRAFFIC_DASHBOARD_URL\":\"https://kiali.$D:$P\"}}"
+        kubectl -n rossoctl-system rollout restart deploy/rossoctl-ui
+        kubectl -n rossoctl-system rollout status deploy/rossoctl-ui --timeout=300s
+      changed_when: true
+
+    - name: HTTP redirects to HTTPS (chart routes pinned to the https listener, one redirect route on http)
+      when: tls
+      ansible.builtin.shell: |
+        set -e
+        D="{{ era.DOMAIN }}"; P="{{ url_port }}"
+        # chart-managed routes attach to every listener of gateway rossoctl-system/http; pin them to https
+        kubectl get httproute -A -o json | python3 -c '
+        import sys, json
+        for r in json.load(sys.stdin)["items"]:
+            prs = r["spec"].get("parentRefs", [])
+            if any(p.get("name") == "http" and p.get("namespace", r["metadata"]["namespace"]) == "rossoctl-system" and p.get("sectionName") != "https" for p in prs):
+                print(r["metadata"]["namespace"], r["metadata"]["name"])' | while read -r ns name; do
+          kubectl -n "$ns" patch httproute "$name" --type=json -p '[{"op":"add","path":"/spec/parentRefs/0/sectionName","value":"https"}]'
+        done
+        kubectl apply -f - <<EOF2
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata: {name: era-http-to-https, namespace: rossoctl-system}
+        spec:
+          parentRefs: [{name: http, namespace: rossoctl-system, sectionName: http}]
+          hostnames: ["*.$D", "$D"]
+          rules:
+          - filters:
+            - type: RequestRedirect
+              requestRedirect: {scheme: https, port: $P, statusCode: 301}
+        EOF2
+      changed_when: true
+
+    # ---- step 9: MCP Gateway ---------------------------------------------------------------------
+    - name: MCP Gateway {{ mcp_gateway_version }}
+      ansible.builtin.shell: |
+        set -e
+        kubectl create namespace gateway-system --dry-run=client -o yaml | kubectl apply -f -
+        helm upgrade --install mcp-gateway oci://ghcr.io/kuadrant/charts/mcp-gateway -n mcp-system --create-namespace --version {{ mcp_gateway_version }} --set broker.create=true
+      changed_when: true
+
+    # ---- Ollama in the cluster (the example_reservation_agent way) --------------------------------
+    - name: Ollama Deployment, PVC and Service in namespace {{ ollama_namespace }}
+      when: era.LLM_PROVIDER == 'in-cluster'
+      ansible.builtin.shell: |
+        set -e
+        kubectl create namespace {{ ollama_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+        kubectl apply -n {{ ollama_namespace }} -f - <<EOF2
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata: {name: ollama-data}
+        spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: {{ ollama_storage }}}}}
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata: {name: ollama, labels: {app: ollama}}
+        spec:
+          replicas: 1
+          strategy: {type: Recreate}
+          selector: {matchLabels: {app: ollama}}
+          template:
+            metadata: {labels: {app: ollama}}
+            spec:
+              containers:
+              - name: ollama
+                image: {{ ollama_image }}
+                ports: [{containerPort: 11434}]
+                env: [{name: OLLAMA_KEEP_ALIVE, value: "-1"}]
+                resources: {requests: {cpu: "2", memory: 4Gi}, limits: {cpu: "6", memory: 10Gi}}
+                volumeMounts: [{name: ollama-data, mountPath: /root/.ollama}]
+              volumes: [{name: ollama-data, persistentVolumeClaim: {claimName: ollama-data}}]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata: {name: ollama}
+        spec: {selector: {app: ollama}, ports: [{port: 11434, targetPort: 11434}]}
+        EOF2
+        kubectl -n {{ ollama_namespace }} rollout status deploy/ollama --timeout=600s
+        kubectl -n {{ ollama_namespace }} exec deploy/ollama -- ollama list | grep -q "{{ era.LLM_MODEL }}" || kubectl -n {{ ollama_namespace }} exec deploy/ollama -- ollama pull {{ era.LLM_MODEL }}
+      args: { executable: /bin/bash }
+      changed_when: true
+
+    # ---- after-restart mesh recovery (pods created before the CNI agent are not enrolled) ----------
+    - name: era-mesh-recover script and boot unit
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: ../files/era-mesh-recover.sh, dest: /usr/local/sbin/era-mesh-recover.sh, mode: "0755" }
+        - { src: ../files/era-mesh-recover.service, dest: /etc/systemd/system/era-mesh-recover.service, mode: "0644" }
+        - { src: ../files/era-sleep-watch.sh, dest: /usr/local/sbin/era-sleep-watch.sh, mode: "0755" }
+        - { src: ../files/era-sleep-watch.service, dest: /etc/systemd/system/era-sleep-watch.service, mode: "0644" }
+        - { src: ../files/era-sleep-watch.timer, dest: /etc/systemd/system/era-sleep-watch.timer, mode: "0644" }
+        - { src: ../files/era-chat.sh, dest: /usr/local/bin/era-chat, mode: "0755" }
+    - name: Enable era-mesh-recover.service and the era-sleep-watch timer (after the Mac slept, refresh credentials and restart the gateway)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        daemon_reload: true
+      loop: [era-mesh-recover.service, era-sleep-watch.timer]
+
+    - name: Platform summary
+      ansible.builtin.shell: |
+        echo "ui:       {{ url_scheme }}://rossoctl-ui.{{ era.DOMAIN }}:{{ url_port }}"
+        echo "keycloak: {{ url_scheme }}://keycloak.{{ era.DOMAIN }}:{{ url_port }}  (admin secret: kubectl -n keycloak get secret keycloak-initial-admin -o jsonpath='{.data.password}' | base64 -d)"
+        echo "mcp:      http://mcp-gateway-istio.gateway-system.svc.cluster.local:8080/mcp (in-cluster)"
+        kubectl get pods -A --no-headers | awk '{print $4}' | sort | uniq -c
+      register: summary
+      changed_when: false
+    - ansible.builtin.debug: { msg: "{{ summary.stdout_lines }}" }

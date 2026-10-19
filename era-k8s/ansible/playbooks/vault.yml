@@ -1,0 +1,365 @@
+---
+# era vault: OpenBao (the open-source fork of Vault) plus HashiCorp's Vault Secrets Operator (VSO),
+# the way the primary cluster's guide "Integrate HashiCorp Vault with Rossoctl's Kubernetes Secrets"
+# does it, minus the Enterprise license. Vault becomes the upstream source of the four platform
+# Secrets rossoctl already reads (same names, same keys; VSO writes into them, no Deployment
+# changes), every read is recorded by two audit devices (a file on its own volume, and stdout, which
+# the SIEMatic kube-logs shipper collects as index=vault), and the server unseals itself at boot with
+# a static key (OpenBao >= 2.4 `seal "static"`), so a cold start of the demo VM stays hands-off.
+# Names follow the primary and Cliff's microshift-runner vault role (namespace vault, pod vault-0,
+# label app.kubernetes.io/name=vault, https://vault.vault.svc.cluster.local:8200, kv-v2 mount
+# "rossoctl", roles <namespace>-vso), so his SIEMatic manifests apply with one container name changed.
+# Findings carried over from that role: OpenBao rejects `audit enable` over the API, so the audit
+# devices are declared in the server config and appear after unseal; the chart's configAnnotation
+# rolls the pod when the config changes. Runs inside the VM as root. Idempotent. Needs ERA_TLS=true.
+- name: OpenBao and the Vault Secrets Operator
+  hosts: cluster
+  become: true
+  gather_facts: false
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+    PATH: /usr/local/bin:/usr/bin:/bin
+  vars:
+    ns: vault
+    release: vault
+    openbao_chart_version: "0.30.4"       # appVersion v2.7.1
+    openbao_image_tag: "2.7.1"
+    vso_ns: vault-secrets-operator-system
+    vso_chart_version: "1.6.0"
+    kv_mount: rossoctl
+    init_file: /etc/era-k8s/vault-init.json        # root token + recovery key (0600); the only copy
+    unseal_key_file: /etc/era-k8s/vault-unseal.key # 32 raw bytes; also in Secret vault/vault-unseal
+    values_file: /etc/era-k8s/openbao-values.yaml
+    # The Secrets Vault takes over (the primary's Vault guide, Steps 5-7): namespace -> secret names.
+    # Each namespace gets a policy, a Kubernetes-auth role, a ServiceAccount, a VaultAuth and one
+    # VaultStaticSecret per Secret, all namespace-scoped: one namespace cannot read another's paths.
+    managed:
+      rossoctl-system: [rossoctl-ui-oauth-secret, otel-db-secret]
+      keycloak: [keycloak-db-secret]
+      mcp-system: [mcp-gateway-session-signing-key]
+  tasks:
+    - name: Preflight
+      ansible.builtin.shell: |
+        set -e
+        helm version --short | grep -q '^v3\.' || { echo "helm 3 required"; exit 1; }
+        kubectl get clusterissuer era-ca >/dev/null || { echo "ClusterIssuer era-ca missing: run era platform with ERA_TLS=true first"; exit 1; }
+        kubectl get storageclass local-path >/dev/null
+        {% for n, names in managed.items() %}{% for s in names %}kubectl -n {{ n }} get secret {{ s }} >/dev/null
+        {% endfor %}{% endfor %}echo ok
+      changed_when: false
+
+    # ---- namespace, server certificate, unseal key ---------------------------------------------------
+    - name: Namespace {{ ns }} and the server certificate from era-ca
+      ansible.builtin.shell: |
+        set -e
+        kubectl create namespace {{ ns }} --dry-run=client -o yaml | kubectl apply -f -
+        kubectl apply -f - <<EOF2
+        apiVersion: cert-manager.io/v1
+        kind: Certificate
+        metadata: {name: {{ release }}-tls, namespace: {{ ns }}}
+        spec:
+          secretName: {{ release }}-tls
+          duration: 8760h
+          dnsNames:
+            - {{ release }}
+            - {{ release }}.{{ ns }}
+            - {{ release }}.{{ ns }}.svc
+            - {{ release }}.{{ ns }}.svc.cluster.local
+            - {{ release }}-active.{{ ns }}.svc.cluster.local
+            - {{ release }}-internal.{{ ns }}.svc.cluster.local
+            - "*.{{ release }}-internal.{{ ns }}.svc.cluster.local"
+            - localhost
+          ipAddresses: ["127.0.0.1"]
+          issuerRef: {name: era-ca, kind: ClusterIssuer, group: cert-manager.io}
+        EOF2
+        kubectl wait --for=condition=Ready certificate/{{ release }}-tls -n {{ ns }} --timeout=120s
+      changed_when: true
+    - name: Static unseal key (32 random bytes; Secret {{ ns }}/{{ release }}-unseal and {{ unseal_key_file }})
+      ansible.builtin.shell: |
+        set -e
+        umask 077
+        if kubectl -n {{ ns }} get secret {{ release }}-unseal >/dev/null 2>&1; then
+          [ -s {{ unseal_key_file }} ] || kubectl -n {{ ns }} get secret {{ release }}-unseal -o jsonpath='{.data.unseal\.key}' | base64 -d > {{ unseal_key_file }}
+          echo "unseal key present"
+        else
+          [ -s {{ unseal_key_file }} ] || openssl rand -out {{ unseal_key_file }} 32
+          kubectl -n {{ ns }} create secret generic {{ release }}-unseal --from-file=unseal.key={{ unseal_key_file }}
+          echo "unseal key created"
+        fi
+        chmod 0600 {{ unseal_key_file }}
+      register: r
+      changed_when: "'created' in r.stdout"
+
+    # ---- the server --------------------------------------------------------------------------------
+    - name: Chart values
+      ansible.builtin.copy:
+        dest: "{{ values_file }}"
+        mode: "0644"
+        content: |
+          # era vault: values for the openbao/openbao chart (written by ansible/playbooks/vault.yml).
+          # The overrides keep the names the primary uses: Service vault.vault.svc, pod vault-0 and the
+          # label app.kubernetes.io/name=vault (the container is still named openbao by the chart).
+          fullnameOverride: {{ release }}
+          nameOverride: {{ release }}
+          global:
+            tlsDisable: false
+          injector:
+            enabled: false
+          ui:
+            enabled: true
+          server:
+            image:
+              tag: "{{ openbao_image_tag }}"
+              pullPolicy: IfNotPresent
+            resources:
+              requests: {cpu: 100m, memory: 128Mi}
+              limits: {cpu: "1", memory: 512Mi}
+            dataStorage:
+              enabled: true
+              size: 2Gi
+            auditStorage:
+              enabled: true
+              size: 1Gi
+            configAnnotation: true
+            extraEnvironmentVars:
+              BAO_CACERT: /openbao/userconfig/{{ release }}-tls/ca.crt
+              VAULT_CACERT: /openbao/userconfig/{{ release }}-tls/ca.crt
+              BAO_TLS_SERVER_NAME: {{ release }}.{{ ns }}.svc.cluster.local
+              VAULT_TLS_SERVER_NAME: {{ release }}.{{ ns }}.svc.cluster.local
+            volumes:
+              - name: tls
+                secret: {secretName: {{ release }}-tls, defaultMode: 0440}
+              - name: unseal
+                secret: {secretName: {{ release }}-unseal, defaultMode: 0440}
+            volumeMounts:
+              - {name: tls, mountPath: /openbao/userconfig/{{ release }}-tls, readOnly: true}
+              - {name: unseal, mountPath: /openbao/userconfig/{{ release }}-unseal, readOnly: true}
+            standalone:
+              enabled: true
+              config: |
+                ui = true
+                listener "tcp" {
+                  address = "[::]:8200"
+                  cluster_address = "[::]:8201"
+                  tls_disable = 0
+                  tls_cert_file = "/openbao/userconfig/{{ release }}-tls/tls.crt"
+                  tls_key_file  = "/openbao/userconfig/{{ release }}-tls/tls.key"
+                }
+                storage "pebbledb" {
+                  path = "/openbao/data/pebbledb"
+                }
+                # Auto-unseal with a key that lives next to the server (OpenBao >= 2.4). A demo
+                # compromise: a laptop that must boot unattended cannot wait for a human with a
+                # recovery key, and there is no KMS at the venue. The key is in a Secret, not here.
+                seal "static" {
+                  current_key_id = "era-1"
+                  current_key    = "file:///openbao/userconfig/{{ release }}-unseal/unseal.key"
+                }
+                # Declared here because OpenBao rejects `audit enable` over the API (Cliff's finding on
+                # the MicroShift runner). file = the auditor's copy; stdout = what the SIEMatic
+                # kube-logs shipper collects as index=vault.
+                audit "file" "file" {
+                  description = "File audit log"
+                  options {
+                    file_path = "/openbao/audit/audit.log"
+                  }
+                }
+                audit "file" "stdout" {
+                  description = "Audit log on stdout for the SIEMatic shipper"
+                  options {
+                    file_path = "stdout"
+                  }
+                }
+    - name: OpenBao chart {{ openbao_chart_version }} (release {{ release }}, namespace {{ ns }})
+      ansible.builtin.shell: |
+        set -e
+        helm upgrade --install {{ release }} openbao --repo https://openbao.github.io/openbao-helm --version {{ openbao_chart_version }} \
+          -n {{ ns }} -f {{ values_file }}
+        for i in $(seq 1 120); do
+          kubectl -n {{ ns }} get pod {{ release }}-0 -o jsonpath='{.status.phase}' 2>/dev/null | grep -q Running && exit 0
+          sleep 5
+        done
+        echo "pod {{ release }}-0 not Running after 10 minutes" >&2
+        kubectl -n {{ ns }} get pods -o wide >&2; kubectl -n {{ ns }} describe pod {{ release }}-0 | tail -20 >&2; exit 1
+      changed_when: true
+    - name: Initialize (once) and confirm the static seal unseals it
+      ansible.builtin.shell: |
+        set -e
+        status() { kubectl -n {{ ns }} exec {{ release }}-0 -- bao status -format=json 2>/dev/null || true; }
+        for i in $(seq 1 60); do status | grep -q '"initialized"' && break; sleep 5; done
+        if ! status | python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin)["initialized"] else 1)'; then
+          umask 077
+          kubectl -n {{ ns }} exec {{ release }}-0 -- bao operator init -format=json -recovery-shares=1 -recovery-threshold=1 > {{ init_file }}
+          echo "initialized; root token and recovery key in {{ init_file }}"
+        fi
+        for i in $(seq 1 30); do
+          status | python3 -c 'import sys,json; sys.exit(0 if not json.load(sys.stdin)["sealed"] else 1)' && { echo "unsealed"; exit 0; }
+          sleep 5
+        done
+        echo "still sealed after init; the static seal is not working" >&2; status >&2; exit 1
+      register: r
+      changed_when: "'initialized' in r.stdout"
+      no_log: true
+    - name: Server pod Ready (the chart's StatefulSet uses OnDelete, so no rollout status)
+      ansible.builtin.shell: kubectl -n {{ ns }} wait --for=condition=Ready pod/{{ release }}-0 --timeout=300s
+      changed_when: false
+
+    # ---- audit devices, kv-v2 mount, Kubernetes auth -------------------------------------------------
+    - name: Audit devices present (declared in the config), kv-v2 mount, Kubernetes auth
+      ansible.builtin.shell: |
+        set -e
+        TOKEN=$(python3 -c 'import json; print(json.load(open("{{ init_file }}"))["root_token"])')
+        bao() { kubectl -n {{ ns }} exec -i {{ release }}-0 -- env BAO_TOKEN="$TOKEN" bao "$@"; }
+        AUDIT=$(bao audit list -format=json 2>/dev/null || echo '{}')
+        for dev in file stdout; do
+          if ! echo "$AUDIT" | grep -q "\"$dev/\""; then
+            echo "audit device $dev/ not declared by the config; trying the API"
+            case $dev in file) bao audit enable -path=file file file_path=/openbao/audit/audit.log ;; stdout) bao audit enable -path=stdout file file_path=stdout ;; esac
+          fi
+        done
+        bao secrets list -format=json | grep -q '"{{ kv_mount }}/"' || bao secrets enable -path={{ kv_mount }} kv-v2
+        bao auth list -format=json | grep -q '"kubernetes/"' || bao auth enable kubernetes
+        bao write auth/kubernetes/config kubernetes_host=https://kubernetes.default.svc:443 >/dev/null
+        bao audit list; bao secrets list | grep '^{{ kv_mount }}/'; bao auth list | grep '^kubernetes/'
+      args: { executable: /bin/bash }
+      register: r
+      changed_when: true
+    - ansible.builtin.debug: { msg: "{{ r.stdout_lines }}" }
+
+    # ---- the managed Secrets: copy into Vault (once), policy and role per namespace -----------------
+    - name: Checksums of the managed Secrets before the cutover
+      ansible.builtin.shell: |
+        {% for n, names in managed.items() %}{% for s in names %}echo "{{ n }}/{{ s }} $(kubectl -n {{ n }} get secret {{ s }} -o json | python3 -c 'import sys,json,hashlib; print(hashlib.sha256(json.dumps({k: v for k, v in json.load(sys.stdin)["data"].items() if k != "_raw"}, sort_keys=True).encode()).hexdigest()[:16])')"
+        {% endfor %}{% endfor %}
+      register: before
+      changed_when: false
+    - name: Policies, roles and the kv-v2 copies (a path is written only if absent)
+      ansible.builtin.shell: |
+        set -e
+        TOKEN=$(python3 -c 'import json; print(json.load(open("{{ init_file }}"))["root_token"])')
+        bao() { kubectl -n {{ ns }} exec -i {{ release }}-0 -- env BAO_TOKEN="$TOKEN" bao "$@"; }
+        {% for n, names in managed.items() %}
+        bao policy write {{ n }}-vso - <<'POLICY'
+        {% for s in names %}path "{{ kv_mount }}/data/{{ s }}" { capabilities = ["read"] }
+        {% endfor %}POLICY
+        bao write auth/kubernetes/role/{{ n }}-vso bound_service_account_names=vault-secrets-auth bound_service_account_namespaces={{ n }} policies={{ n }}-vso ttl=1h >/dev/null
+        {% for s in names %}
+        if bao kv get -mount={{ kv_mount }} {{ s }} >/dev/null 2>&1; then echo "{{ kv_mount }}/{{ s }}: present"; else
+          kubectl -n {{ n }} get secret {{ s }} -o json | python3 -c 'import sys,json,base64; d=json.load(sys.stdin).get("data") or {}; print(json.dumps({k: base64.b64decode(v).decode() for k,v in d.items()}))' \
+            | bao kv put -mount={{ kv_mount }} {{ s }} - >/dev/null
+          echo "{{ kv_mount }}/{{ s }}: copied from {{ n }}/{{ s }}"
+        fi
+        {% endfor %}{% endfor %}
+      args: { executable: /bin/bash }
+      register: r
+      changed_when: "'copied' in r.stdout"
+      no_log: true
+    - ansible.builtin.debug: { msg: "{{ r.stdout_lines | select('search', ': (present|copied)') | list }}" }
+
+    # ---- Vault Secrets Operator ----------------------------------------------------------------------
+    - name: VSO chart {{ vso_chart_version }} in {{ vso_ns }}, with the CA and a VaultConnection
+      ansible.builtin.shell: |
+        set -e
+        kubectl create namespace {{ vso_ns }} --dry-run=client -o yaml | kubectl apply -f -
+        kubectl -n {{ vso_ns }} create secret generic {{ release }}-ca --from-file=ca.crt=/etc/era-k8s/era-ca.crt --dry-run=client -o yaml | kubectl apply -f -
+        helm upgrade --install vault-secrets-operator vault-secrets-operator --repo https://helm.releases.hashicorp.com --version {{ vso_chart_version }} \
+          -n {{ vso_ns }} --set controller.manager.image.pullPolicy=IfNotPresent --wait --timeout 10m
+        kubectl wait --for=condition=Established crd/vaultconnections.secrets.hashicorp.com crd/vaultauths.secrets.hashicorp.com crd/vaultstaticsecrets.secrets.hashicorp.com --timeout=60s
+        kubectl apply -f - <<EOF2
+        apiVersion: secrets.hashicorp.com/v1beta1
+        kind: VaultConnection
+        metadata: {name: vault-connection, namespace: {{ vso_ns }}}
+        spec:
+          address: https://{{ release }}.{{ ns }}.svc.cluster.local:8200
+          caCertSecretRef: {{ release }}-ca
+          tlsServerName: {{ release }}.{{ ns }}.svc.cluster.local
+          skipTLSVerify: false
+        EOF2
+      changed_when: true
+    - name: Per namespace, a ServiceAccount, a VaultAuth and one VaultStaticSecret per Secret (create false, the Secrets exist)
+      ansible.builtin.shell: |
+        set -e
+        kubectl apply -f - <<EOF2
+        {% for n, names in managed.items() %}
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata: {name: vault-secrets-auth, namespace: {{ n }}}
+        ---
+        apiVersion: secrets.hashicorp.com/v1beta1
+        kind: VaultAuth
+        metadata: {name: vault-auth, namespace: {{ n }}}
+        spec:
+          method: kubernetes
+          mount: kubernetes
+          kubernetes: {role: {{ n }}-vso, serviceAccount: vault-secrets-auth}
+          vaultConnectionRef: {{ vso_ns }}/vault-connection
+        {% for s in names %}
+        ---
+        apiVersion: secrets.hashicorp.com/v1beta1
+        kind: VaultStaticSecret
+        metadata: {name: {{ s }}, namespace: {{ n }}}
+        spec:
+          vaultAuthRef: vault-auth
+          mount: {{ kv_mount }}
+          path: {{ s }}
+          type: kv-v2
+          refreshAfter: 1h
+          # excludeRaw: without it VSO adds a _raw key holding the whole secret as JSON (found 2026-10-18)
+          destination: {name: {{ s }}, create: false, transformation: {excludeRaw: true}}
+        {% endfor %}
+        ---
+        {% endfor %}
+        EOF2
+      changed_when: true
+    - name: Every VaultStaticSecret synced (status.secretMAC set) and the Secret data unchanged
+      ansible.builtin.shell: |
+        set -e
+        n=1
+        for i in $(seq 1 36); do
+          n=$(kubectl get vaultstaticsecret -A -o json | python3 -c 'import sys,json; it=json.load(sys.stdin)["items"]; print(sum(1 for x in it if not (x.get("status") or {}).get("secretMAC")))')
+          if [ "$n" = 0 ]; then break; fi
+          sleep 5
+        done
+        kubectl get vaultstaticsecret -A
+        if [ "$n" != 0 ]; then
+          echo "$n VaultStaticSecret(s) not synced" >&2
+          kubectl -n {{ vso_ns }} logs deploy/vault-secrets-operator-controller-manager --since=5m | tail -30 >&2
+          exit 1
+        fi
+        {% for n, names in managed.items() %}{% for s in names %}echo "{{ n }}/{{ s }} $(kubectl -n {{ n }} get secret {{ s }} -o json | python3 -c 'import sys,json,hashlib; print(hashlib.sha256(json.dumps({k: v for k, v in json.load(sys.stdin)["data"].items() if k != "_raw"}, sort_keys=True).encode()).hexdigest()[:16])')"
+        {% endfor %}{% endfor %}
+      register: after
+      changed_when: false
+    - name: Secret data identical before and after the cutover
+      ansible.builtin.assert:
+        that: "(before.stdout_lines | select('search', ' [0-9a-f]{16}$') | list) == (after.stdout_lines | select('search', ' [0-9a-f]{16}$') | list)"
+        fail_msg: "VSO changed a Secret's data: before={{ before.stdout_lines }} after={{ after.stdout_lines }}"
+
+    # ---- evidence: the audit trail ---------------------------------------------------------------------
+    - name: Audit trail (what the demo's Vault view shows, VSO reads by namespace service account)
+      ansible.builtin.shell: |
+        kubectl -n {{ ns }} logs {{ release }}-0 --since=15m | python3 -c '
+        import sys, json
+        for line in sys.stdin:
+            try: e = json.loads(line)
+            except ValueError: continue
+            if e.get("type") != "response": continue
+            p = ((e.get("request") or {}).get("path") or "")
+            if not p.startswith("{{ kv_mount }}/data/"): continue
+            m = ((e.get("auth") or {}).get("metadata") or {})
+            print(e.get("time"), "path=" + p, "service_account=%s/%s" % (m.get("service_account_namespace", "n/a"), m.get("service_account_name", "n/a")))' | tail -8
+      register: audit
+      changed_when: false
+    - ansible.builtin.debug: { msg: "{{ audit.stdout_lines if audit.stdout_lines else ['(no kv reads in the audit log yet)'] }}" }
+
+    - name: Summary
+      ansible.builtin.shell: |
+        echo "server:    https://{{ release }}.{{ ns }}.svc.cluster.local:8200 (OpenBao {{ openbao_image_tag }}, static auto-unseal, audit: file + stdout)"
+        echo "ui:        kubectl -n {{ ns }} port-forward svc/{{ release }} 8200:8200 then https://127.0.0.1:8200; root token in {{ init_file }}"
+        echo "vso:       $(kubectl -n {{ vso_ns }} get deploy -o name | head -1), VaultConnection {{ vso_ns }}/vault-connection"
+        echo "audit log: kubectl -n {{ ns }} logs {{ release }}-0 | grep type...response   (the SIEMatic kube-logs shipper collects this as index=vault)"
+        kubectl -n {{ ns }} get pods -o wide --no-headers | awk '{print "pod:       " $1, $2, $3}'
+        kubectl get vaultstaticsecret -A --no-headers | awk '{print "synced:    " $1 "/" $2}'
+      register: summary
+      changed_when: false
+    - ansible.builtin.debug: { msg: "{{ summary.stdout_lines }}" }

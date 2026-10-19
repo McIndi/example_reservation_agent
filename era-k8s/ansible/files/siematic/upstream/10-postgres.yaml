@@ -1,0 +1,114 @@
+# Postgres for SIEMatic.
+#
+# Uses the SCL Postgres image rather than docker.io/library/postgres. The
+# Docker Hub image assumes it runs as its own postgres user and fails under
+# restricted-v2, which assigns an arbitrary UID from the namespace range. The
+# SCL image is built for exactly that.
+#
+# PostgreSQL 18, on a dated tag rather than latest so a rebuild upstream
+# cannot change the database under a running deployment. The tag is the newest
+# published as of 2026-09-05. The image labels identify the 18 stream but not
+# the patch level, so confirm it after rollout:
+#
+#   oc rsh statefulset/siematic-postgres -n siematic psql -c 'SELECT version()'
+#
+# There is a c9s build of the same stream if CentOS Stream 10 is a problem.
+#
+# Credentials come from Vault. 05-vault-secrets.yaml carries the
+# VaultStaticSecret that writes the siematic-postgres Secret this file reads,
+# and the README has the kv-v2 write that puts the values there. No password
+# lives in this repo.
+#
+# Apply with: oc apply -f 10-postgres.yaml
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: siematic-postgres
+  namespace: siematic
+  labels:
+    app: siematic-postgres
+spec:
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+  selector:
+    app: siematic-postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: siematic-postgres
+  namespace: siematic
+  labels:
+    app: siematic-postgres
+spec:
+  serviceName: siematic-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: siematic-postgres
+  template:
+    metadata:
+      labels:
+        app: siematic-postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: quay.io/sclorg/postgresql-18-c10s:20260902
+          env:
+            - name: POSTGRESQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-user
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-password
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-name
+          ports:
+            - name: postgres
+              containerPort: 5432
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/pgsql/data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command: ["/usr/libexec/check-container"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/usr/libexec/check-container", "--live"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

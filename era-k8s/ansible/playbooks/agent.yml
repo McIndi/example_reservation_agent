@@ -1,0 +1,175 @@
+---
+# era agent: deploy the example_reservation_agent (tool, gateway registration + credential, token
+# refresher, agent) onto this cluster, following its README step by step. Source: the repo checkout
+# named by agent_repo/agent_branch (cloned into /opt/era-k8s/example_reservation_agent), or
+# /vagrant/example_reservation_agent when that mount exists. Images are pinned by digest with
+# IfNotPresent so the demo survives a restart without internet.
+- name: Deploy the reservation agent
+  hosts: cluster
+  become: true
+  gather_facts: false
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+    PATH: /usr/local/bin:/usr/bin:/bin
+  vars:
+    ns: team1
+    agent_repo: https://github.com/McIndi/example_reservation_agent.git
+    agent_branch: main
+    agent_dir: /opt/era-k8s/example_reservation_agent
+    pin_images: true
+    # The manifests name `:latest`; the apply tasks rewrite that tag to agent_image_tag (a no-op for the
+    # default), because an arm64 node cannot even start the amd64-only `:latest` for the later digest pin.
+    # `era-k8s` is the multi-arch (amd64 + arm64) build from the agent repo's era-k8s branch; `latest` is main's
+    # amd64-only build (what the first, frozen installation runs): `era agent -e agent_image_tag=latest`.
+    agent_image_tag: era-k8s
+    images:
+      reservation-agent: { deploy: reservation-agent, container: agent, image: "ghcr.io/mcindi/reservation-agent:{{ agent_image_tag }}" }
+      reservation-tool:  { deploy: reservation-tool,  container: mcp,   image: "ghcr.io/mcindi/reservation-tool:{{ agent_image_tag }}" }
+  tasks:
+    - name: Source checkout
+      ansible.builtin.shell: |
+        set -e
+        if [ -d /vagrant/example_reservation_agent/manifests ]; then echo "/vagrant/example_reservation_agent"; exit 0; fi
+        if [ -d {{ agent_dir }}/.git ]; then git -C {{ agent_dir }} fetch -q && git -C {{ agent_dir }} checkout -q {{ agent_branch }} && git -C {{ agent_dir }} pull -q --ff-only; else git clone -q --branch {{ agent_branch }} {{ agent_repo }} {{ agent_dir }}; fi
+        echo "{{ agent_dir }}"
+      register: src
+      changed_when: false
+    - ansible.builtin.set_fact: { manifests: "{{ src.stdout_lines[-1] }}/manifests" }
+    - ansible.builtin.debug: { msg: "manifests from {{ manifests }}" }
+
+    - name: Namespace {{ ns }} (labelled for the shared gateway and AuthBridge injection)
+      ansible.builtin.shell: |
+        kubectl create namespace {{ ns }} --dry-run=client -o yaml | kubectl apply -f -
+        kubectl label namespace {{ ns }} shared-gateway-access=true --overwrite
+      changed_when: false
+
+    # ---- Step 2: the tool ----------------------------------------------------------------------
+    - name: Tool (ServiceAccount, Deployment, Service, AgentRuntime)
+      ansible.builtin.shell: sed -e 's/NAMESPACE/{{ ns }}/g' -e 's#ghcr.io/mcindi/reservation-tool:latest#ghcr.io/mcindi/reservation-tool:{{ agent_image_tag }}#' {{ manifests }}/reservation-tool.yaml | kubectl apply -f - && kubectl -n {{ ns }} rollout status deployment/reservation-tool --timeout=300s
+      changed_when: true
+    - name: Wait for the operator to inject AuthBridge (the first pod predates the AgentRuntime)
+      ansible.builtin.shell: |
+        for i in $(seq 1 60); do
+          kubectl -n {{ ns }} get pod -l app.kubernetes.io/name=reservation-tool -o json | python3 -c '
+        import sys, json
+        pods = [p for p in json.load(sys.stdin)["items"] if not p["metadata"].get("deletionTimestamp")]
+        ok = [p for p in pods if any(c["name"] == "authbridge-proxy" for c in p["spec"]["containers"]) and p["status"].get("phase") == "Running"]
+        sys.exit(0 if ok and len(pods) == len(ok) else 1)' && exit 0
+          sleep 5
+        done
+        echo "no injected Running tool pod after 5 minutes" >&2; exit 1
+      changed_when: false
+    - name: Check the ports (tool on 8001 behind AuthBridge's reverse proxy on 8000)
+      ansible.builtin.shell: |
+        kubectl -n {{ ns }} get pod -l app.kubernetes.io/name=reservation-tool -o json | python3 -c '
+        import sys, json
+        pods = [p for p in json.load(sys.stdin)["items"] if not p["metadata"].get("deletionTimestamp")]
+        for c in pods[0]["spec"]["containers"]: print(c["name"], [x.get("containerPort") for x in c.get("ports", [])], [e["value"] for e in c.get("env", []) if e["name"] == "PORT"])'
+      register: ports
+      changed_when: false
+    - ansible.builtin.debug: { msg: "{{ ports.stdout_lines }}" }
+    - ansible.builtin.assert:
+        that: "'mcp [8001]' in ports.stdout and 'authbridge-proxy' in ports.stdout"
+        fail_msg: "sidecar not injected or wrong ports; is operator-chart.featureGates.injectTools=true?"
+
+    - name: Register with MCP Gateway (HTTPRoute + MCPServerRegistration)
+      ansible.builtin.shell: sed 's/NAMESPACE/{{ ns }}/g' {{ manifests }}/reservation-tool-mcp-gateway.yaml | kubectl apply -f -
+      changed_when: true
+    - name: Gateway credential (Keycloak client, Secrets, ConfigMap, credentialRef)
+      ansible.builtin.script: ../files/configure-gateway-credential.sh
+      environment:
+        NS: "{{ ns }}"
+        DEPLOYMENT: reservation-tool
+        REGISTRATION: reservation-tool-servers
+        DISCOVERY_CLIENT_ID: mcp-gateway-reservation-discovery
+        DISCOVERY_SECRET: reservation-tool-gateway-credential
+        CLIENT_SECRET_NAME: reservation-tool-discovery-client
+        SETTINGS_CONFIGMAP: reservation-tool-token-refresher-settings
+        MAPPER_NAME: reservation-tool-audience
+      register: cred
+      changed_when: true
+    - ansible.builtin.debug: { msg: "{{ cred.stdout_lines }}" }
+    - name: Registration READY with 7 tools (gateway discovery can take a minute)
+      ansible.builtin.shell: kubectl -n {{ ns }} get mcpserverregistration reservation-tool-servers -o custom-columns='READY:.status.conditions[?(@.type=="Ready")].status,TOOLS:.status.discoveredTools' --no-headers
+      register: reg
+      until: "'True' in reg.stdout and '7' in reg.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+    - ansible.builtin.debug: { msg: "registration: {{ reg.stdout }}" }
+
+    - name: Token refresher CronJob, and one run now
+      ansible.builtin.shell: |
+        set -e
+        sed 's/NAMESPACE/{{ ns }}/g' {{ manifests }}/reservation-tool-token-refresher.yaml | kubectl apply -f -
+        JOB="reservation-tool-token-refresh-test-$(date +%s)"
+        kubectl -n {{ ns }} create job --from=cronjob/reservation-tool-token-refresher "$JOB"
+        kubectl -n {{ ns }} wait --for=condition=complete "job/$JOB" --timeout=180s
+        kubectl -n {{ ns }} logs "job/$JOB" | tail -1
+      register: refresh
+      changed_when: true
+    - ansible.builtin.assert:
+        that: "'Credential refreshed' in refresh.stdout"
+
+    # ---- Step 3: the agent --------------------------------------------------------------------
+    - name: Agent (ServiceAccount, Deployment, Service, AgentRuntime)
+      ansible.builtin.shell: sed -e 's/NAMESPACE/{{ ns }}/g' -e 's#ghcr.io/mcindi/reservation-agent:latest#ghcr.io/mcindi/reservation-agent:{{ agent_image_tag }}#' {{ manifests }}/reservation-agent.yaml | kubectl apply -f - && kubectl -n {{ ns }} rollout status deployment/reservation-agent --timeout=300s
+      changed_when: true
+    - name: Confirm the agent's outbound traffic goes through its sidecar
+      ansible.builtin.shell: kubectl -n {{ ns }} exec deploy/reservation-agent -c agent -- sh -c 'env | sort | grep -E "^(HTTP_PROXY|HTTPS_PROXY|NO_PROXY|MCP_URL|MCP_TOOL_PREFIX|LLM_API_BASE|LLM_MODEL)="'
+      register: agentenv
+      changed_when: false
+    - ansible.builtin.debug: { msg: "{{ agentenv.stdout_lines }}" }
+    - ansible.builtin.assert:
+        that: "'HTTP_PROXY=http://127.0.0.1:8081' in agentenv.stdout"
+
+    # ---- IBAC: the chain is a Helm value of the platform (platform.yml); this only verifies it ------
+    - name: The agent rendered AuthBridge config carries the IBAC chain
+      ansible.builtin.shell: |
+        kubectl -n {{ ns }} get cm authbridge-config-reservation-agent -o jsonpath='{.data.config\.yaml}' | grep -c -E 'name. (a2a-parser|mcp-parser|ibac)'
+      register: chain
+      changed_when: false
+    - ansible.builtin.assert:
+        that: chain.stdout | int == 3
+        fail_msg: "IBAC chain missing from the agent config; run era platform (authBridge.pipeline value) and restart the agent"
+    - name: (legacy, kept for a running cluster) Enable IBAC on the agent sidecar
+      when: false
+      ansible.builtin.script: ../files/enable-ibac.sh
+      environment:
+        NS: "{{ ns }}"
+        AGENT: reservation-agent
+        JUDGE_ENDPOINT: "{{ (lookup('ansible.builtin.file', '/etc/era-k8s/config.env') | regex_search('ERA_LLM_API_BASE=(.*)', '\\1') | first) | regex_replace('/v1/?$', '') }}"
+        JUDGE_MODEL: "{{ lookup('ansible.builtin.file', '/etc/era-k8s/config.env') | regex_search('ERA_LLM_MODEL=(.*)', '\\1') | first }}"
+      register: ibac
+      changed_when: true
+      # (no debug of ibac.stdout_lines here: the task above is always skipped, so the register holds no
+      # stdout and the debug failed every fresh install; found on the first arm64 run, 2026-10-18)
+
+    # ---- Pin the images (offline-safe demo) ----------------------------------------------------
+    - name: Pin both Deployments to the running digest with IfNotPresent
+      when: pin_images
+      ansible.builtin.shell: |
+        set -e
+        D=$(skopeo inspect --format '{% raw %}{{.Digest}}{% endraw %}' docker://{{ item.value.image }})
+        REPO={{ item.value.image.split(':')[0] }}
+        kubectl -n {{ ns }} set image deployment/{{ item.value.deploy }} {{ item.value.container }}=$REPO@$D
+        kubectl -n {{ ns }} patch deployment {{ item.value.deploy }} --type=json -p "[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/$(kubectl -n {{ ns }} get deploy {{ item.value.deploy }} -o json | python3 -c 'import sys,json; cs=json.load(sys.stdin)["spec"]["template"]["spec"]["containers"]; print([c["name"] for c in cs].index("{{ item.value.container }}"))')/imagePullPolicy\",\"value\":\"IfNotPresent\"}]"
+        kubectl -n {{ ns }} rollout status deployment/{{ item.value.deploy }} --timeout=300s
+        echo "{{ item.key }} pinned to $D"
+      loop: "{{ images | dict2items }}"
+      loop_control: { label: "{{ item.key }}" }
+      changed_when: true
+
+    - name: The token-refresher CronJob pulls IfNotPresent too (its manifest says Always; offline at the venue it would fail every half hour, found 2026-10-18)
+      when: pin_images
+      ansible.builtin.shell: |
+        kubectl -n {{ ns }} patch cronjob reservation-tool-token-refresher --type=json \
+          -p '[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
+      register: cj
+      changed_when: "'no change' not in cj.stdout"
+
+    - name: Summary
+      ansible.builtin.shell: kubectl -n {{ ns }} get pods -o wide --no-headers | awk '{print $1, $2, $3}'; kubectl -n {{ ns }} get mcpserverregistration,cronjob
+      register: summary
+      changed_when: false
+    - ansible.builtin.debug: { msg: "{{ summary.stdout_lines }}" }

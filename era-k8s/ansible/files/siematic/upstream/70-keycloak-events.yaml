@@ -1,0 +1,75 @@
+# Kept separate from kube_logs so this pod has no cross-namespace pod-log RBAC.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: siematic-keycloak-events
+  namespace: siematic
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siematic-keycloak-events
+  namespace: siematic
+  labels:
+    app: siematic-keycloak-events
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: siematic-keycloak-events
+  template:
+    metadata:
+      labels:
+        app: siematic-keycloak-events
+    spec:
+      serviceAccountName: siematic-keycloak-events
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keycloak-events
+          image: ghcr.io/mcindi/siematic@sha256:b3d85c072dd9e03ac87954e613525b20f1bfa3e21d2a842a3e245bfc59dacc6b
+          command: ["python", "manage.py", "agent"]
+          envFrom:
+            - configMapRef:
+                name: siematic-app
+            - secretRef:
+                name: siematic-app
+            - secretRef:
+                name: siematic-keycloak-shipper
+          env:
+            - name: DJANGO_SETTINGS_MODULE
+              value: SIEMatic.settings.agent
+            - name: SIEMATIC_AGENT_PROFILE
+              value: /etc/siematic/profile/keycloak-events.json
+            - name: SIEMATIC_AGENT_ID
+              value: shipper-keycloak-events
+          volumeMounts:
+            - name: indexer-ca
+              mountPath: /etc/siematic/indexer-ca
+              readOnly: true
+            - name: shipper-profiles
+              mountPath: /etc/siematic/profile
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: indexer-ca
+          configMap:
+            name: siematic-indexer-ca
+        - name: shipper-profiles
+          configMap:
+            name: siematic-shipper-profiles

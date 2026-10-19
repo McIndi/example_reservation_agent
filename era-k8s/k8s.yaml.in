@@ -1,0 +1,164 @@
+# k8s.yaml -- single-node Kubernetes (kubeadm + CRI-O + Calico + local-path storage) on Fedora 44, bridged to the LAN,
+# with the controller toolset (Ansible, helm, kubectl) inside, exportable as a pre-init image (export/RECIPIENT.md).
+# Built and run on Intel and Apple silicon Macs with Lima 2.x (vz).
+#
+# Usage:
+#   limactl start --name k8s k8s.yaml --tty=false --timeout 25m
+#   limactl start --name k8s --set 'del(.networks)' k8s.yaml --tty=false    # without socket_vmnet (no LAN address)
+#   export KUBECONFIG="$HOME/.lima/k8s/copied-from-guest/kubeconfig.yaml"
+#   kubectl get nodes
+#
+# Derived from Lima's own k8s template (Ubuntu, containerd, flannel), rewritten for dnf, CRI-O,
+# SELinux enforcing, firewalld, Calico, and a bridged interface present from first boot.
+
+minimumLimaVersion: 2.0.0
+
+# Guest OS: Fedora 44 Cloud, the same image as the `podman` instance (already in Lima's cache).
+# Alternatives: template:_images/almalinux-10 (RHEL 10 rebuild; ships firewalld, no zram);
+# a local RHEL 10 qcow2 via an `images:` entry. CentOS Stream needs legacy BIOS: not bootable on vz Intel.
+base:
+- template:_images/fedora-44
+
+cpus: 8
+memory: "24GiB"
+disk: "100GiB"
+
+# No host folders: nothing in the image may depend on the host (the playbooks are baked into /opt/era-k8s
+# and the export sanitizer runs without a mount). Add one here if you want, e.g. a repo checkout at /vagrant.
+mounts: []
+# CRI-O is the runtime; keep Lima from installing its own containerd/nerdctl.
+containerd:
+  system: false
+  user: false
+
+# Optional, macOS 26 only: Apple's sparse image format for vz, aimed at I/O performance. One-way
+# (cannot be converted back to raw); the snapshot helper (lima-snap) works with either format.
+# vmOpts:
+#   vz:
+#     diskImageFormat: asif
+
+# rossoctl's URLs carry port 8080 (and 8443 once TLS is on), because Kind maps host 8080 to the
+# NodePort 30080. Same scheme here: Lima forwards the NodePorts to those host ports, and inside the
+# VM firewalld forwards 8080/8443 to the NodePorts so the identical URLs work when the VM runs on
+# another hypervisor and is reached by its own address (see provision step 4).
+portForwards:
+- guestPort: 30080
+  hostPort: 8080
+- guestPort: 30443
+  hostPort: 8443
+
+# Bridged from the start: lima0 gets a DHCP address on the LAN via socket_vmnet (already installed
+# and used by the podman instance). eth0 stays the Lima user-mode network (192.168.5.15) and is the
+# node's own address; lima0 is only how clients reach the API server and NodePorts from the LAN.
+networks:
+- lima: bridged
+
+provision:  # filled from provision/*.sh by bin/render-template; do not add entries here
+probes:
+- description: "kubeadm to be installed"
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    if ! timeout 30s bash -c "until command -v kubeadm >/dev/null 2>&1; do sleep 3; done"; then
+      echo >&2 "kubeadm is not installed yet"
+      exit 1
+    fi
+  hint: |
+    See "/var/log/cloud-init-output.log" in the guest
+- description: "kubernetes images to be pulled"
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    [ "{{.Param.kubeadmInit}}" = "true" ] || exit 0
+    if ! timeout 30s bash -c "images=\"$(kubeadm config images list)\"; until for image in \$images; do sudo crictl inspecti \$image >/dev/null 2>&1 || exit 1; done; do sleep 3; done"; then
+      echo >&2 "k8s images are not pulled yet"
+      exit 1
+    fi
+- description: "kubeadm to be completed"
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    [ "{{.Param.kubeadmInit}}" = "true" ] || exit 0
+    if ! timeout 300s bash -c "until test -f /etc/kubernetes/admin.conf; do sleep 3; done"; then
+      echo >&2 "k8s is not running yet"
+      exit 1
+    fi
+  hint: |
+    The k8s kubeconfig file has not yet been created.
+- description: "kubernetes cluster to be running"
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    [ "{{.Param.kubeadmInit}}" = "true" ] || exit 0
+    if ! timeout 300s bash -c "until kubectl version >/dev/null 2>&1; do sleep 3; done"; then
+      echo >&2 "kubernetes cluster is not up and running yet"
+      exit 1
+    fi
+- description: "calico to be ready"
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    [ "{{.Param.kubeadmInit}}" = "true" ] || exit 0
+    if ! timeout 600s bash -c "until kubectl -n calico-system wait --for=condition=ready pod -l k8s-app=calico-node --timeout=30s >/dev/null 2>&1; do sleep 5; done"; then
+      echo >&2 "calico-node is not ready yet"
+      exit 1
+    fi
+  hint: |
+    kubectl -n tigera-operator logs deploy/tigera-operator ; kubectl -n calico-system get pods
+- description: "default storageclass to exist"
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    [ "{{.Param.kubeadmInit}}" = "true" ] || exit 0
+    if ! timeout 120s bash -c "until kubectl get storageclass local-path >/dev/null 2>&1; do sleep 3; done"; then
+      echo >&2 "local-path StorageClass is not there yet"
+      exit 1
+    fi
+- description: "coredns deployment to be running"
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    [ "{{.Param.kubeadmInit}}" = "true" ] || exit 0
+    kubectl wait -n kube-system --timeout=300s --for=condition=available deploy coredns
+
+copyToHost:
+- guest: "/root/.kube/config.localhost"
+  host: "{{.Dir}}/copied-from-guest/kubeconfig.yaml"
+  deleteOnStop: true
+- guest: "/root/.kube/config.lan"
+  host: "{{.Dir}}/copied-from-guest/kubeconfig-lan.yaml"
+  deleteOnStop: true
+
+message: |
+  (kubeadmInit=false builds stop before `kubeadm init`: `limactl stop k8s && ./lima-snap create k8s pre-init`,
+  then export per export/RECIPIENT.md; the next `limactl start k8s` initializes the cluster via k8s-init.service,
+  and a stop/start after that copies the kubeconfigs below.)
+  To run `kubectl` on the host, run the following commands:
+  ------
+  export KUBECONFIG="{{.Dir}}/copied-from-guest/kubeconfig.yaml"
+  kubectl get nodes
+  ------
+  From another machine on the LAN use "{{.Dir}}/copied-from-guest/kubeconfig-lan.yaml".
+
+param:
+  # pkgs.k8s.io channel: stable or prerelease
+  stability: "stable"
+  # Kubernetes minor to install: "stable" resolves the newest at creation time, or e.g. "v1.36"
+  release: "stable"
+  # exact version for kubeadm init: "stable" or e.g. "v1.37.1"
+  version: "stable"
+  # Calico release tag (operator install); v3.33.0 is built against Kubernetes 1.37
+  calicoVersion: "v3.33.0"
+  # Helm 3 release for the controller toolset (rossoctl needs >= 3.18, < 4)
+  helmVersion: "v3.22.1"
+  # rancher/local-path-provisioner release tag (default StorageClass)
+  localPathVersion: "v0.0.37"
+  # platform settings written to /etc/era-k8s/config.env (see provision step 2)
+  domain: "localtest.me"
+  llmProvider: "in-cluster"
+  llmApiBase: "http://ollama.ollama.svc.cluster.local:11434/v1"
+  llmModel: "llama3.2:3b-instruct-q4_K_M"
+  tls: "true"
+  # "true": initialize the cluster during provisioning. "false": install everything, pre-pull images,
+  # and leave `kubeadm init` to k8s-init.service at the next boot (the exportable pre-init image).
+  kubeadmInit: "true"

@@ -1,0 +1,65 @@
+# SIEMatic application settings.
+#
+# This ConfigMap holds everything safe to read. The two values that are not,
+# DJANGO_SECRET_KEY and OIDC_RP_CLIENT_SECRET, arrive from Vault through
+# 05-vault-secrets.yaml as a Secret of the same name. Both objects are
+# consumed with envFrom, so a setting added here reaches every process
+# without editing a Deployment.
+#
+# Three values below are specific to the demo cluster
+# (apps.openshift.example.com). On another cluster, change the Route
+# hostname wherever it appears: DJANGO_ALLOWED_HOSTS,
+# DJANGO_CSRF_TRUSTED_ORIGINS, and the Route host in 30-web.yaml. It must also
+# match the Keycloak client's valid redirect URI.
+#
+# Apply with: oc apply -f 20-config.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: siematic-app
+  namespace: siematic
+data:
+  DJANGO_SETTINGS_MODULE: SIEMatic.settings.web
+  DJANGO_ALLOWED_HOSTS: "siematic.apps.openshift.example.com,siematic-web.siematic.svc.cluster.local,siematic-web,siematic-indexer.siematic.svc.cluster.local,siematic-indexer,localhost,127.0.0.1"
+
+  # Every timestamp in one zone. Act 4 joins four evidence stores on time, and
+  # Keycloak, Vault, and AuthBridge all emit UTC.
+  DJANGO_TIME_ZONE: UTC
+
+  # The cluster collects stdout. Writing to logs/ would need a writable working
+  # directory, which an arbitrary UID does not have.
+  DJANGO_LOG_TO_FILE: "False"
+  DJANGO_LOG_LEVEL: INFO
+
+  # CherryPy serves HTTPS using the service serving certificate, and the Route
+  # reencrypts to it. TLS_ENABLED turns on secure cookies, HSTS, and the
+  # HTTP-to-HTTPS redirect.
+  SIEMATIC_TLS_ENABLED: "True"
+  CHERRYPY_SSL: "True"
+  CHERRYPY_SSL_CERT: /etc/tls/private/tls.crt
+  CHERRYPY_SSL_KEY: /etc/tls/private/tls.key
+
+  # Django 6 checks Origin on unsafe requests, so the Route hostname has to be
+  # trusted or no browser POST succeeds, including the admin login.
+  DJANGO_CSRF_TRUSTED_ORIGINS: "https://siematic.apps.openshift.example.com"
+  DJANGO_TRUST_PROXY_PROTO_HEADER: "True"
+
+  DATABASE_ENGINE: django.db.backends.postgresql
+  DATABASE_HOST: siematic-postgres.siematic.svc.cluster.local
+  DATABASE_PORT: "5432"
+
+  # The indexer is internal-only. Shippers verify this service's serving
+  # certificate using the injected service CA mounted by their Deployments.
+  INDEXER_HOSTNAME: siematic-indexer.siematic.svc.cluster.local
+  INDEXER_PORT: "8000"
+  INDEXER_TLS: "True"
+  INDEXER_CA_BUNDLE: /etc/siematic/indexer-ca/service-ca.crt
+
+  # Keycloak. The realm the rest of the demo already uses, not a second one.
+  OIDC_ISSUER: https://keycloak-keycloak.apps.openshift.example.com/realms/rossoctl
+  OIDC_RP_CLIENT_ID: siematic
+  OIDC_PROVIDER_NAME: Keycloak
+  # Realm role to Django group. No role maps to Agent: machine identities do
+  # not arrive through the browser flow.
+  OIDC_GROUP_MAP: '{"siematic":["Registered User"],"rossoctl-admin":["Registered User"]}'

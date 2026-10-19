@@ -1,0 +1,59 @@
+# Receipt retention is the idempotency window; prune it explicitly rather than
+# coupling database maintenance to crawler findings.
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: siematic-prune-batch-receipts
+  namespace: siematic
+spec:
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: prune-batch-receipts
+              image: ghcr.io/mcindi/siematic@sha256:b3d85c072dd9e03ac87954e613525b20f1bfa3e21d2a842a3e245bfc59dacc6b
+              command: ["python", "manage.py", "prune_batch_receipts", "--days", "30"]
+              envFrom:
+                - configMapRef:
+                    name: siematic-app
+                - secretRef:
+                    name: siematic-app
+              env:
+                - name: DATABASE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: siematic-postgres
+                      key: database-user
+                - name: DATABASE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: siematic-postgres
+                      key: database-password
+                - name: DATABASE_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: siematic-postgres
+                      key: database-name
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 250m
+                  memory: 256Mi

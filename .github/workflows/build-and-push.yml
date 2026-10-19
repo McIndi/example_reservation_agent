@@ -3,6 +3,7 @@ name: Build and push images
 on:
   push:
     branches: [main, era-k8s]
+    paths-ignore: ["era-k8s/**"]   # the deployment tooling under era-k8s/ does not change the images
     tags: ["v*"]
   pull_request:
     branches: [main]

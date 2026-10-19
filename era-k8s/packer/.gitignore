@@ -1,0 +1,6 @@
+output/
+output-*/
+packer_cache/
+isos/*
+!isos/.keep
+*.log

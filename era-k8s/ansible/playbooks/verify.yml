@@ -1,0 +1,134 @@
+---
+# era verify: proves the cluster is healthy. Runs inside the VM as root (kubeconfig /etc/kubernetes/admin.conf).
+- name: Verify the era-k8s cluster
+  hosts: cluster
+  become: true
+  gather_facts: false
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  vars:
+    failures: []
+  tasks:
+    - name: Remove a leftover verification namespace from an earlier failed run
+      kubernetes.core.k8s:
+        state: absent
+        kind: Namespace
+        name: era-verify
+        wait: true
+    - name: Remove failed provisioner helper pods left by an earlier run
+      ansible.builtin.shell: kubectl -n local-path-storage delete pod --field-selector=status.phase=Failed --ignore-not-found
+      register: hp
+      changed_when: "'deleted' in hp.stdout"
+
+    - name: Host state
+      ansible.builtin.shell: |
+        set -e
+        printf 'selinux=%s firewalld=%s crio=%s kubelet=%s swap=%s\n' \
+          "$(getenforce)" "$(systemctl is-active firewalld)" "$(systemctl is-active crio)" \
+          "$(systemctl is-active kubelet)" "$(swapon --show --noheadings | wc -l)"
+      register: host
+      changed_when: false
+    - ansible.builtin.debug: { msg: "{{ host.stdout }}" }
+    - name: Host state must be enforcing/active/active/active/no swap
+      ansible.builtin.assert:
+        that: host.stdout == 'selinux=Enforcing firewalld=active crio=active kubelet=active swap=0'
+
+    - name: Node
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: nodes
+    - name: One Ready node
+      ansible.builtin.assert:
+        that:
+          - nodes.resources | length == 1
+          - (nodes.resources[0].status.conditions | selectattr('type','equalto','Ready') | map(attribute='status') | first) == 'True'
+        fail_msg: "node not Ready: {{ nodes.resources | map(attribute='status.conditions') | list }}"
+
+    - name: Pods in kube-system, calico-system, local-path-storage, tigera-operator
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ item }}"
+      loop: [kube-system, calico-system, tigera-operator, local-path-storage]
+      register: pods
+    - name: Every pod Running or Succeeded
+      ansible.builtin.assert:
+        that: (item.resources | rejectattr('status.phase', 'in', ['Running','Succeeded']) | list | length) == 0
+        fail_msg: "{{ item.item }}: {{ item.resources | rejectattr('status.phase','in',['Running','Succeeded']) | map(attribute='metadata.name') | list }}"
+      loop: "{{ pods.results }}"
+      loop_control: { label: "{{ item.item }}" }
+
+    - name: Default StorageClass is local-path
+      kubernetes.core.k8s_info:
+        kind: StorageClass
+        name: local-path
+      register: sc
+    - ansible.builtin.assert:
+        that:
+          - sc.resources | length == 1
+          - (sc.resources[0].metadata.annotations['storageclass.kubernetes.io/is-default-class'] | default('false')) == 'true'
+
+    - name: PVC bind test (namespace era-verify)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          - { apiVersion: v1, kind: Namespace, metadata: { name: era-verify } }
+          - apiVersion: v1
+            kind: PersistentVolumeClaim
+            metadata: { name: probe, namespace: era-verify }
+            spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 100Mi } } }
+          - apiVersion: v1
+            kind: Pod
+            metadata: { name: writer, namespace: era-verify }
+            spec:
+              restartPolicy: Never
+              containers:
+                - name: w
+                  image: registry.k8s.io/e2e-test-images/busybox:1.36.1-1
+                  command: [sh, -c, "echo ok > /data/probe && cat /data/probe"]
+                  volumeMounts: [{ name: d, mountPath: /data }]
+              volumes: [{ name: d, persistentVolumeClaim: { claimName: probe } }]
+    - name: Wait for the writer pod to succeed
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: era-verify
+        name: writer
+      register: writer
+      until: writer.resources and writer.resources[0].status.phase in ['Succeeded','Failed']
+      retries: 40
+      delay: 3
+    - ansible.builtin.assert:
+        that: writer.resources[0].status.phase == 'Succeeded'
+        fail_msg: "PVC writer pod {{ writer.resources[0].status.phase }}"
+
+    - name: NetworkPolicy test (default-deny blocks pod-to-pod, removing it restores)
+      ansible.builtin.shell: |
+        set -e
+        kubectl -n era-verify run np-server --image=registry.k8s.io/e2e-test-images/agnhost:2.47 --restart=Never -- netexec --http-port=8080 >/dev/null 2>&1 || true
+        kubectl -n era-verify wait --for=condition=Ready pod/np-server --timeout=120s >/dev/null
+        IP=$(kubectl -n era-verify get pod np-server -o jsonpath='{.status.podIP}')
+        kubectl -n era-verify apply -f - >/dev/null <<EOF2
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata: {name: default-deny, namespace: era-verify}
+        spec: {podSelector: {}, policyTypes: [Ingress]}
+        EOF2
+        sleep 3
+        if kubectl -n era-verify run np-client-denied --rm -i --restart=Never --image=registry.k8s.io/e2e-test-images/agnhost:2.47 --command -- /bin/sh -c "timeout 5 wget -qO- http://$IP:8080/hostname" >/dev/null 2>&1; then echo "DENY-FAILED"; exit 1; fi
+        kubectl -n era-verify delete networkpolicy default-deny >/dev/null
+        sleep 3
+        kubectl -n era-verify run np-client-allowed --rm -i --restart=Never --image=registry.k8s.io/e2e-test-images/agnhost:2.47 --command -- /bin/sh -c "timeout 10 wget -qO- http://$IP:8080/hostname" | grep -q np-server && echo "networkpolicy ok"
+      args: { executable: /bin/bash }
+      register: np
+      changed_when: false
+    - ansible.builtin.debug: { msg: "{{ np.stdout_lines }}" }
+
+    - name: Clean up the verification namespace
+      kubernetes.core.k8s:
+        state: absent
+        kind: Namespace
+        name: era-verify
+        wait: true
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "era verify: OK (node Ready, system pods running, default StorageClass binds, NetworkPolicy enforced)"

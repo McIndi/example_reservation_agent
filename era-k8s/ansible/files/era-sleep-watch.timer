@@ -1,0 +1,10 @@
+[Unit]
+Description=era-k8s: every minute, notice a wall-clock jump (the Mac slept) and refresh gateway credentials
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

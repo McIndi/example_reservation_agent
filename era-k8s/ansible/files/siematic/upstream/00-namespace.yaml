@@ -1,0 +1,15 @@
+# The SIEMatic namespace.
+#
+# Deliberately outside the Istio ambient mesh. SIEMatic is the audit plane:
+# it records what the mesh did, and keeping it off the data path means a mesh
+# problem cannot also take down the evidence of that problem. Add the
+# istio.io/dataplane-mode label here if you decide otherwise.
+#
+# Apply with: oc apply -f 00-namespace.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: siematic
+  labels:
+    app.kubernetes.io/part-of: siematic

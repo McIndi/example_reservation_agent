@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: siematic-shipper-profiles
+  namespace: siematic
+data:
+  kube-logs.json: |
+    {
+      "version": 1,
+      "plugin": "kube_logs",
+      "poll_interval": 5,
+      "targets": [
+        {
+          "namespace": "team1",
+          "deployment": "weather-service",
+          "container": "authbridge-proxy",
+          "index": "authbridge",
+          "source": "weather-service/authbridge-proxy",
+          "sourcetype": "logfmt"
+        },
+        {
+          "namespace": "team1",
+          "deployment": "weather-tool",
+          "container": "authbridge-proxy",
+          "index": "authbridge",
+          "source": "weather-tool/authbridge-proxy",
+          "sourcetype": "logfmt"
+        },
+        {
+          "namespace": "team1",
+          "deployment": "reservation-agent",
+          "container": "authbridge-proxy",
+          "index": "authbridge",
+          "source": "reservation-agent/authbridge-proxy",
+          "sourcetype": "logfmt"
+        },
+        {
+          "namespace": "team1",
+          "deployment": "reservation-tool",
+          "container": "authbridge-proxy",
+          "index": "authbridge",
+          "source": "reservation-tool/authbridge-proxy",
+          "sourcetype": "logfmt"
+        },
+        {
+          "namespace": "vault",
+          "selector": "app.kubernetes.io/name=vault",
+          "container": "vault",
+          "index": "vault",
+          "source": "vault/audit",
+          "sourcetype": "json",
+          "vault_audit": true
+        }
+      ]
+    }
+  keycloak-events.json: |
+    {
+      "version": 1,
+      "plugin": "keycloak_events",
+      "poll_interval": 30,
+      "realm": "rossoctl",
+      "index": "keycloak",
+      "source": "keycloak/rossoctl",
+      "host": "keycloak"
+    }

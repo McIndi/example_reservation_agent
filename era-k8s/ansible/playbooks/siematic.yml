@@ -1,0 +1,337 @@
+---
+# era siematic: the SIEMatic audit plane (McIndi) on this cluster, from Cliff's OpenShift manifests
+# (ansible/files/siematic/upstream, verbatim) rendered for a plain Kubernetes cluster by render.py
+# (the deltas are listed in ansible/files/siematic/README.md). Secrets are generated inside vault-0 and
+# synced by VSO; the Keycloak clients and roles are created through the admin API; the Django users,
+# the seeded searches and the "Zero trust evidence" dashboard follow Cliff's microshift-runner role.
+# Needs era vault first. Runs inside the VM as root. Idempotent.
+- name: SIEMatic audit plane
+  hosts: cluster
+  become: true
+  gather_facts: false
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+    PATH: /usr/local/bin:/usr/bin:/bin
+  vars:
+    ns: siematic
+    files_dir: "{{ playbook_dir }}/../files/siematic"
+    upstream_dir: "{{ files_dir }}/upstream"
+    rendered_dir: /etc/era-k8s/siematic/rendered
+    kc_ns: keycloak
+    kc_svc: keycloak-service
+    kc_realm: rossoctl
+    kc_internal: "http://keycloak-service.keycloak.svc.cluster.local:8080"
+    demo_user_secret: rossoctl-test-user           # the UI login; it gets the siematic role too
+    vault_ns: vault
+    vault_pod: vault-0
+    kv_mount: rossoctl
+    init_file: /etc/era-k8s/vault-init.json
+    keep_deployments: "reservation-agent,reservation-tool"
+    siematic_image: ghcr.io/mcindi/siematic
+    # The digest written in Cliff's manifests (main's amd64 build of 68ec29d, what the frozen backup runs).
+    siematic_upstream_digest: sha256:b3d85c072dd9e03ac87954e613525b20f1bfa3e21d2a842a3e245bfc59dacc6b
+    # The digest to deploy: the render step rewrites every image reference from the upstream digest to this
+    # one. Default: the multi-arch (amd64 + arm64) build from the SIEMatic era-k8s branch (6289b8a). The
+    # upstream digest itself (amd64 only) is what the first, frozen installation runs:
+    #   era siematic -e siematic_image_digest="{{ siematic_upstream_digest }}"
+    siematic_image_digest: sha256:976afadb6139b0ceee0d1f776ad788e249e87006cdeffaacf3b343225be20cdc
+    # Generated once inside vault-0, as in Cliff's role (the values never leave the pod).
+    generated:
+      - path: siematic-postgres
+        script: |
+          pw=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)
+          test "$(printf '%s' "$pw" | wc -c)" -eq 32
+          bao kv put -mount=MOUNT siematic-postgres database-user=siematic database-name=siematic database-password="$pw"
+      - path: siematic-app
+        script: |
+          django=$(dd if=/dev/urandom bs=48 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-50)
+          oidc=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)
+          test "$(printf '%s' "$django" | wc -c)" -eq 50
+          test "$(printf '%s' "$oidc" | wc -c)" -eq 32
+          bao kv put -mount=MOUNT siematic-app DJANGO_SECRET_KEY="$django" OIDC_RP_CLIENT_SECRET="$oidc"
+      - path: siematic-kube-shipper
+        script: |
+          pw=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)
+          test "$(printf '%s' "$pw" | wc -c)" -eq 32
+          bao kv put -mount=MOUNT siematic-kube-shipper INDEXER_USERNAME=shipper-kube-logs INDEXER_PASSWORD="$pw"
+      - path: siematic-keycloak-shipper
+        script: |
+          pw=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)
+          client=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)
+          test "$(printf '%s' "$pw" | wc -c)" -eq 32
+          test "$(printf '%s' "$client" | wc -c)" -eq 32
+          bao kv put -mount=MOUNT siematic-keycloak-shipper INDEXER_USERNAME=shipper-keycloak-events INDEXER_PASSWORD="$pw" KEYCLOAK_BASE_URL="KC_INTERNAL" KEYCLOAK_CLIENT_ID=siematic-events KEYCLOAK_CLIENT_SECRET="$client" KEYCLOAK_TOKEN_REALM="KC_REALM"
+      - path: siematic-break-glass
+        script: |
+          pw=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)
+          test "$(printf '%s' "$pw" | wc -c)" -eq 32
+          bao kv put -mount=MOUNT siematic-break-glass username=break-glass password="$pw"
+  tasks:
+    - name: Read /etc/era-k8s/config.env
+      ansible.builtin.shell: set -a; . /etc/era-k8s/config.env; env | grep '^ERA_'
+      register: era_env
+      changed_when: false
+    - ansible.builtin.set_fact:
+        era: "{{ dict(era_env.stdout_lines | map('regex_replace', '^ERA_([^=]+)=(.*)$', '\\1=\\2') | map('split', '=', 1)) }}"
+    - ansible.builtin.set_fact:
+        url_port: "{{ '8443' if (era.TLS | lower) == 'true' else '8080' }}"
+        kc_public: "https://keycloak.{{ era.DOMAIN }}:8443"
+        siematic_public: "https://siematic.{{ era.DOMAIN }}:8443"
+    - name: Preflight (TLS platform, Vault unsealed, VSO, the gateway's https listener, PyYAML)
+      ansible.builtin.shell: |
+        set -e
+        [ "{{ era.TLS | lower }}" = true ] || { echo "ERA_TLS must be true (the UI is served over the gateway's https listener)"; exit 1; }
+        kubectl get clusterissuer era-ca >/dev/null
+        kubectl -n rossoctl-system get gateway http -o jsonpath='{.spec.listeners[*].name}' | grep -qw https
+        kubectl -n {{ vault_ns }} exec {{ vault_pod }} -- bao status -format=json | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d["initialized"] and not d["sealed"] else 1)' || { echo "vault-0 is not initialized and unsealed: run era vault"; exit 1; }
+        [ -s {{ init_file }} ] || { echo "{{ init_file }} missing"; exit 1; }
+        kubectl -n vault-secrets-operator-system get vaultconnection vault-connection >/dev/null
+        kubectl -n {{ kc_ns }} get secret {{ demo_user_secret }} >/dev/null
+        python3 -c 'import yaml' || { echo "python3-pyyaml missing"; exit 1; }
+        ! grep -rq 'image: {{ siematic_image }}:' {{ upstream_dir }}/ || { echo "a SIEMatic image is pinned by tag, not digest: a tag is not an audit record"; exit 1; }
+        grep -rq '{{ siematic_image }}@{{ siematic_upstream_digest }}' {{ upstream_dir }}/30-web.yaml || { echo "upstream 30-web.yaml does not carry siematic_upstream_digest: update the variable"; exit 1; }
+        echo ok
+      changed_when: false
+
+    # ---- render Cliff's manifests for this cluster ---------------------------------------------------
+    - name: Render the manifests ({{ upstream_dir }} -> {{ rendered_dir }})
+      ansible.builtin.shell: |
+        set -e
+        rm -rf {{ rendered_dir }}; mkdir -p {{ rendered_dir }}
+        python3 {{ files_dir }}/render.py {{ upstream_dir }} {{ rendered_dir }} {{ era.DOMAIN }} {{ url_port }} {{ kc_public }} {{ kc_internal }} {{ keep_deployments }}
+        # deploy digest (still a digest, so still an audit record); a no-op when it equals the upstream one
+        sed -i 's#{{ siematic_image }}@{{ siematic_upstream_digest }}#{{ siematic_image }}@{{ siematic_image_digest }}#g' {{ rendered_dir }}/*.yaml
+        grep -rq '{{ siematic_image }}@{{ siematic_image_digest }}' {{ rendered_dir }}/30-web.yaml || { echo "rendered 30-web.yaml lacks the deploy digest"; exit 1; }
+        ! grep -rq '{{ siematic_image }}@{{ siematic_upstream_digest }}' {{ rendered_dir }}/ || [ "{{ siematic_image_digest }}" = "{{ siematic_upstream_digest }}" ] || { echo "an upstream digest survived the rewrite"; exit 1; }
+        echo "images: {{ siematic_image }}@{{ siematic_image_digest }}"
+      register: r
+      changed_when: true
+    - ansible.builtin.debug: { msg: "{{ r.stdout_lines }}" }
+
+    # ---- Vault: policy, role, generated values -------------------------------------------------------
+    - name: Vault policy and Kubernetes-auth role siematic-vso; generate the values that are absent
+      ansible.builtin.shell: |
+        set -e
+        TOKEN=$(python3 -c 'import json; print(json.load(open("{{ init_file }}"))["root_token"])')
+        bao() { kubectl -n {{ vault_ns }} exec -i {{ vault_pod }} -- env BAO_TOKEN="$TOKEN" bao "$@"; }
+        bao policy write siematic-vso - <<'POLICY'
+        path "{{ kv_mount }}/data/siematic-postgres"         { capabilities = ["read"] }
+        path "{{ kv_mount }}/data/siematic-app"              { capabilities = ["read"] }
+        path "{{ kv_mount }}/data/siematic-kube-shipper"     { capabilities = ["read"] }
+        path "{{ kv_mount }}/data/siematic-keycloak-shipper" { capabilities = ["read"] }
+        POLICY
+        bao write auth/kubernetes/role/siematic-vso bound_service_account_names=vault-secrets-auth bound_service_account_namespaces={{ ns }} policies=siematic-vso ttl=1h >/dev/null
+        {% for g in generated %}
+        if bao kv get -mount={{ kv_mount }} {{ g.path }} >/dev/null 2>&1; then echo "{{ kv_mount }}/{{ g.path }}: present"; else
+          kubectl -n {{ vault_ns }} exec -i {{ vault_pod }} -- env BAO_TOKEN="$TOKEN" sh -s <<'GEN'
+        {{ g.script | replace('MOUNT', kv_mount) | replace('KC_INTERNAL', kc_internal) | replace('KC_REALM', kc_realm) | indent(8) }}
+        GEN
+          echo "{{ kv_mount }}/{{ g.path }}: generated"
+        fi
+        {% endfor %}
+      args: { executable: /bin/bash }
+      register: r
+      changed_when: "'generated' in r.stdout"
+      no_log: true
+    - ansible.builtin.debug: { msg: "{{ r.stdout_lines | select('search', ': (present|generated)') | list }}" }
+
+    # ---- Keycloak: the two clients, the roles, the demo user -----------------------------------------
+    - name: Keycloak clients siematic and siematic-events, realm roles, siematic role on the demo user
+      ansible.builtin.shell: |
+        set -e
+        TOKEN=$(python3 -c 'import json; print(json.load(open("{{ init_file }}"))["root_token"])')
+        bao() { kubectl -n {{ vault_ns }} exec -i {{ vault_pod }} -- env BAO_TOKEN="$TOKEN" bao "$@"; }
+        export OIDC_SECRET=$(bao kv get -mount={{ kv_mount }} -field=OIDC_RP_CLIENT_SECRET siematic-app | tr -d '\r')
+        export EVENTS_SECRET=$(bao kv get -mount={{ kv_mount }} -field=KEYCLOAK_CLIENT_SECRET siematic-keycloak-shipper | tr -d '\r')
+        export DEMO_USER=$(kubectl -n {{ kc_ns }} get secret {{ demo_user_secret }} -o jsonpath='{.data.username}' | base64 -d)
+        export KC_NS={{ kc_ns }} KC_SVC={{ kc_svc }} KC_REALM={{ kc_realm }} SIEMATIC_PUBLIC={{ siematic_public }}
+        bash {{ files_dir }}/keycloak-clients.sh
+      args: { executable: /bin/bash }
+      register: kc
+      changed_when: true
+    - ansible.builtin.debug: { msg: "{{ kc.stdout_lines | select('search', '^(>>>|SIEMatic login)') | list }}" }
+
+    # ---- namespace, Vault-backed Secrets, certificates -----------------------------------------------
+    - name: Namespace (outside the mesh, on purpose) and the four VaultStaticSecrets
+      ansible.builtin.shell: |
+        set -e
+        kubectl apply -f {{ rendered_dir }}/00-namespace.yaml
+        kubectl label namespace {{ ns }} shared-gateway-access=true --overwrite
+        kubectl apply -f {{ rendered_dir }}/05-vault-secrets.yaml
+        for i in $(seq 1 36); do
+          n=$(kubectl -n {{ ns }} get vaultstaticsecret -o json | python3 -c 'import sys,json; it=json.load(sys.stdin)["items"]; print(sum(1 for x in it if not (x.get("status") or {}).get("secretMAC")))')
+          [ "$n" = 0 ] && [ "$(kubectl -n {{ ns }} get secret siematic-postgres siematic-app siematic-kube-shipper siematic-keycloak-shipper --no-headers 2>/dev/null | wc -l)" = 4 ] && break
+          sleep 5
+        done
+        kubectl -n {{ ns }} get vaultstaticsecret
+        kubectl -n {{ ns }} get secret siematic-postgres siematic-app siematic-kube-shipper siematic-keycloak-shipper
+      changed_when: true
+    - name: Indexer certificate from era-ca (Secret siematic-indexer-tls) and the CA bundle ConfigMap the shippers mount
+      ansible.builtin.shell: |
+        set -e
+        kubectl apply -f - <<EOF2
+        apiVersion: cert-manager.io/v1
+        kind: Certificate
+        metadata: {name: siematic-indexer-tls, namespace: {{ ns }}}
+        spec:
+          secretName: siematic-indexer-tls
+          duration: 8760h
+          dnsNames: [siematic-indexer, siematic-indexer.{{ ns }}, siematic-indexer.{{ ns }}.svc, siematic-indexer.{{ ns }}.svc.cluster.local]
+          issuerRef: {name: era-ca, kind: ClusterIssuer, group: cert-manager.io}
+        EOF2
+        kubectl wait --for=condition=Ready certificate/siematic-indexer-tls -n {{ ns }} --timeout=120s
+        kubectl -n {{ ns }} create configmap siematic-indexer-ca --from-file=service-ca.crt=/etc/era-k8s/era-ca.crt --dry-run=client -o yaml | kubectl apply -f -
+      changed_when: true
+
+    # ---- the core: Postgres, config, profiles, web (+ HTTPRoute), crawler, indexer, maintenance -------
+    - name: Apply the core and wait for Postgres, the web and the indexer
+      ansible.builtin.shell: |
+        set -e
+        for f in 10-postgres 20-config 25-shipper-profiles 30-web 40-crawler 50-indexer 80-maintenance; do kubectl apply -f {{ rendered_dir }}/$f.yaml; done
+        kubectl -n {{ ns }} rollout status statefulset/siematic-postgres --timeout=600s
+        kubectl -n {{ ns }} rollout status deployment/siematic-web --timeout=900s
+        kubectl -n {{ ns }} rollout status deployment/siematic-indexer --timeout=600s
+        kubectl -n {{ ns }} rollout status deployment/siematic-crawler --timeout=600s
+      changed_when: true
+
+    # ---- Django: shipper identities, break-glass superuser, seeded content shared with every login ----
+    - name: Shipper users (Agent group only), break-glass superuser, seed_default_content, share it, check_shipper_users
+      ansible.builtin.shell: |
+        set -e
+        TOKEN=$(python3 -c 'import json; print(json.load(open("{{ init_file }}"))["root_token"])')
+        bao() { kubectl -n {{ vault_ns }} exec -i {{ vault_pod }} -- env BAO_TOKEN="$TOKEN" bao "$@"; }
+        dj() { kubectl -n {{ ns }} exec -i deploy/siematic-web -c web -- "$@"; }
+        KUBE_PW=$(bao kv get -mount={{ kv_mount }} -field=INDEXER_PASSWORD siematic-kube-shipper | tr -d '\r')
+        KC_PW=$(bao kv get -mount={{ kv_mount }} -field=INDEXER_PASSWORD siematic-keycloak-shipper | tr -d '\r')
+        BG_PW=$(bao kv get -mount={{ kv_mount }} -field=password siematic-break-glass | tr -d '\r')
+        SHIPPER='import os
+        from django.contrib.auth import get_user_model
+        from django.contrib.auth.models import Group
+        u, _ = get_user_model().objects.get_or_create(username=os.environ["U"])
+        u.set_password(os.environ["P"]); u.is_active = True; u.save()
+        u.groups.add(Group.objects.get(name="Agent")); u.groups.remove(Group.objects.get(name="Registered User"))
+        print("shipper user", u.username, "groups", sorted(g.name for g in u.groups.all()))'
+        kubectl -n {{ ns }} exec -i deploy/siematic-web -c web -- env U=shipper-kube-logs P="$KUBE_PW" python manage.py shell -c "$SHIPPER"
+        kubectl -n {{ ns }} exec -i deploy/siematic-web -c web -- env U=shipper-keycloak-events P="$KC_PW" python manage.py shell -c "$SHIPPER"
+        kubectl -n {{ ns }} exec -i deploy/siematic-web -c web -- env P="$BG_PW" python manage.py shell -c 'import os
+        from django.contrib.auth import get_user_model
+        u, _ = get_user_model().objects.get_or_create(username="break-glass")
+        u.set_password(os.environ["P"]); u.is_staff = True; u.is_superuser = True; u.is_active = True; u.save()
+        print("break-glass superuser ok")'
+        dj python manage.py seed_default_content --owner break-glass
+        # the seeded rows are private to their owner; the demo signs in through Keycloak as someone else
+        dj python manage.py shell -c 'from dashboarding.models import Dashboard
+        from search2.models import SavedSearch
+        d = Dashboard.objects.filter(created_by__username="break-glass").update(shared=True)
+        s = SavedSearch.objects.filter(owner__username="break-glass").update(is_public=True)
+        print("shared", d, "dashboards and", s, "saved searches")'
+        dj python manage.py check_shipper_users
+        # the demo's own content: the denial searches and the Zero trust evidence dashboard (seed_default_content
+        # ships SIEMatic's generic host dashboards only; the primary built these by hand after seeding)
+        dj python manage.py shell < {{ files_dir }}/demo-content.py
+      args: { executable: /bin/bash }
+      register: dj
+      changed_when: true
+    - ansible.builtin.debug: { msg: "{{ dj.stdout_lines | select('search', '(shipper user|break-glass|shared|Seeded|seeded|check|OK|ok)') | list }}" }
+
+    # ---- the shippers ------------------------------------------------------------------------------
+    - name: Shippers (kube-logs with RBAC in team1 and vault; keycloak-events)
+      ansible.builtin.shell: |
+        set -e
+        kubectl apply -f {{ rendered_dir }}/60-kube-logs.yaml
+        kubectl apply -f {{ rendered_dir }}/70-keycloak-events.yaml
+        kubectl -n {{ ns }} rollout status deployment/siematic-kube-logs --timeout=300s
+        kubectl -n {{ ns }} rollout status deployment/siematic-keycloak-events --timeout=300s
+        # A shipper that comes up before the indexer answers its first checkpoint fetch sits silently
+        # forever (found 2026-10-18: heartbeats, no login, no checkpoints). Each one must log in to the
+        # indexer within two minutes, or it is restarted once (it resumes from its checkpoints).
+        for d in siematic-kube-logs siematic-keycloak-events; do
+          u=${d#siematic-}; u=shipper-${u}
+          for attempt in 1 2; do
+            for i in $(seq 1 24); do
+              kubectl -n {{ ns }} logs deploy/siematic-indexer --since=10m | grep -q "accepted for user: $u" && break 2
+              sleep 5
+            done
+            echo "$d never logged in to the indexer; restarting it (attempt $attempt)"
+            kubectl -n {{ ns }} rollout restart deployment/$d >/dev/null
+            kubectl -n {{ ns }} rollout status deployment/$d --timeout=300s >/dev/null
+          done
+          echo "$d: logged in to the indexer"
+        done
+      changed_when: true
+
+    - name: First checkpoint of every kube-logs target at its container's start (see files/siematic/seed-checkpoints.py)
+      ansible.builtin.shell: |
+        set -e
+        TARGETS=$(kubectl -n {{ ns }} get configmap siematic-shipper-profiles -o jsonpath='{.data.kube-logs\.json}' | python3 -c '
+        import json, subprocess, sys
+        out = []
+        for t in json.load(sys.stdin)["targets"]:
+            ns, c = t["namespace"], t["container"]
+            if t.get("deployment"):
+                sel = subprocess.check_output(["kubectl", "-n", ns, "get", "deploy", t["deployment"], "-o", "jsonpath={.spec.selector.matchLabels}"], text=True)
+                sel = ",".join(f"{k}={v}" for k, v in json.loads(sel).items()); key = t["deployment"]
+            else:
+                sel = key = t["selector"]
+            pods = json.loads(subprocess.check_output(["kubectl", "-n", ns, "get", "pods", "-l", sel, "-o", "json"], text=True))["items"]
+            pod = next(p for p in pods if p["status"].get("phase") == "Running" and not p["metadata"].get("deletionTimestamp"))
+            st = next(s for s in pod["status"]["containerStatuses"] if s["name"] == c)
+            out.append({"target": f"kube_logs:{ns}/{key}/{c}", "index": t["index"], "source": t["source"],
+                        "pod_uid": pod["metadata"]["uid"], "container_id": st.get("containerID", ""),
+                        "restart_count": st.get("restartCount", 0), "started_at": st["state"]["running"]["startedAt"]})
+        print(json.dumps(out))')
+        OUT=$(kubectl -n {{ ns }} exec -i deploy/siematic-web -c web -- env TARGETS_JSON="$TARGETS" python manage.py shell < {{ files_dir }}/seed-checkpoints.py 2>/dev/null | tail -1)
+        echo "$OUT"
+        if ! echo "$OUT" | grep -q '^seeded 0 '; then
+          kubectl -n {{ ns }} rollout restart deployment/siematic-kube-logs >/dev/null
+          kubectl -n {{ ns }} rollout status deployment/siematic-kube-logs --timeout=300s >/dev/null
+          echo "kube-logs shipper restarted to pick the checkpoints up"
+        fi
+        for i in $(seq 1 30); do
+          n=$(kubectl -n {{ ns }} exec -i deploy/siematic-web -c web -- python manage.py shell -c 'from agent.models import Checkpoint; print(Checkpoint.objects.filter(target__startswith="kube_logs:", events_delivered__gt=0).count())' 2>/dev/null | tail -1)
+          [ "${n:-0}" -ge 3 ] && { echo "kube-logs targets delivering: $n"; exit 0; }
+          sleep 5
+        done
+        echo "kube-logs targets delivering after 150 s: ${n:-0} of 3 (a target that logged nothing yet stays at 0; see the checkpoint lines below)"
+      args: { executable: /bin/bash }
+      register: seed
+      changed_when: "'restarted' in seed.stdout"
+    - ansible.builtin.debug: { msg: "{{ seed.stdout_lines }}" }
+
+    # ---- verification (Cliff's rollout checks) -------------------------------------------------------
+    - name: Give the shippers 90 s to fail closed if they are going to
+      ansible.builtin.pause: { seconds: 90 }
+    - name: Pods, restarts, shipper errors, events per index, the route
+      ansible.builtin.shell: |
+        set -e
+        kubectl -n {{ ns }} get pods -o wide --no-headers | awk '{print $1, $2, $3, "restarts=" $4}'
+        restarts=$(kubectl -n {{ ns }} get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' | sort -u | tr '\n' ' ')
+        echo "restart counts: $restarts"
+        for d in siematic-kube-logs siematic-keycloak-events; do echo "$d error lines: $(kubectl -n {{ ns }} logs deploy/$d | grep -ciE 'error|traceback|exception' || true)"; done
+        kubectl -n {{ ns }} exec -i deploy/siematic-web -c web -- python manage.py shell -c 'from agent.models import Checkpoint
+        for c in Checkpoint.objects.all().order_by("target"): print("checkpoint", c.agent.agent_id, c.target, c.events_delivered)' 2>/dev/null
+        kubectl -n {{ ns }} exec siematic-postgres-0 -- psql -U siematic -d siematic -Atc "select index, count(*) as total, count(*) filter (where created > now() - interval '10 minutes') as recent, to_char(max(created) at time zone 'UTC','HH24:MI:SS') as latest_utc from events_event group by index order by index"
+        echo "route accepted: $(kubectl -n {{ ns }} get httproute siematic -o jsonpath='{.status.parents[0].conditions[?(@.type=="Accepted")].status}')"
+        echo "healthz via the gateway: $(curl -sk -o /dev/null -w '%{http_code}' --resolve siematic.{{ era.DOMAIN }}:30443:127.0.0.1 https://siematic.{{ era.DOMAIN }}:30443/healthz)"
+        echo "login page via the gateway: $(curl -sk -o /dev/null -w '%{http_code}' --resolve siematic.{{ era.DOMAIN }}:30443:127.0.0.1 https://siematic.{{ era.DOMAIN }}:30443/)"
+      register: v
+      changed_when: false
+    - ansible.builtin.debug: { msg: "{{ v.stdout_lines }}" }
+    - ansible.builtin.assert:
+        that:
+          - "'restart counts: 0 ' in v.stdout"
+          - "'siematic-kube-logs error lines: 0' in v.stdout"
+          - "'siematic-keycloak-events error lines: 0' in v.stdout"
+          - "'route accepted: True' in v.stdout"
+          - "'healthz via the gateway: 200' in v.stdout"
+        fail_msg: "SIEMatic is not healthy; see the lines above"
+
+    - name: Summary
+      ansible.builtin.shell: |
+        echo "siematic: {{ siematic_public }}  (sign in through Keycloak as the UI's demo user; break-glass password: bao kv get -mount={{ kv_mount }} -field=password siematic-break-glass)"
+        echo "demo search: index=\"authbridge\" extracted_fields__code=\"ibac.blocked\"   dashboard: Zero trust evidence"
+        echo "indexes: authbridge (reservation agent + tool sidecars), vault (OpenBao audit on stdout), keycloak (realm events), agents (shipper status)"
+        echo "on the Mac: siematic.{{ era.DOMAIN }} must be in /etc/hosts next to the other platform names"
+      register: s
+      changed_when: false
+    - ansible.builtin.debug: { msg: "{{ s.stdout_lines }}" }

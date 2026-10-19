@@ -1,0 +1,31 @@
+#!/bin/bash
+# era -- the cluster VM's own command. Installed at /usr/local/bin/era with the playbooks at /opt/era-k8s.
+#   era init       initialize the cluster (k8s-init.sh; idempotent)
+#   era verify     prove the cluster is healthy (ansible/playbooks/verify.yml)
+#   era platform   install the rossoctl platform (playbooks/platform.yml)
+#   era agent      deploy the reservation agent (playbooks/agent.yml)
+#   era vault      OpenBao + Vault Secrets Operator over the platform Secrets (playbooks/vault.yml)
+#   era siematic   the SIEMatic audit plane (playbooks/siematic.yml)
+#   era all        verify, platform, agent, vault, siematic in that order; stops at the first failure
+#   era update     refresh /opt/era-k8s from the repo named in /etc/era-k8s/config.env (ERA_REPO, ERA_BRANCH)
+#   era mesh-recover  re-enroll pre-mesh pods after a restart (also runs at boot)
+#   era config     show /etc/era-k8s/config.env
+set -euo pipefail
+ROOT=/opt/era-k8s
+[ "$(id -u)" = 0 ] || exec sudo -E "$0" "$@"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  init)     exec /usr/local/sbin/k8s-init.sh ;;
+  all)      for step in verify platform agent vault siematic; do
+              echo "=== era $step ==="; "$0" "$step" "$@" || { echo "era: $step failed; fix it and run 'era $step' again, then the remaining steps" >&2; exit 1; }
+            done; echo "era: all steps done" ;;
+  verify|platform|agent|vault|siematic)
+            [ -f "$ROOT/ansible/playbooks/$cmd.yml" ] || { echo "era: playbook $cmd.yml not present in $ROOT" >&2; exit 1; }
+            cd "$ROOT/ansible" && exec ansible-playbook "playbooks/$cmd.yml" "$@" ;;
+  update)   . /etc/era-k8s/config.env; : "${ERA_REPO:?set ERA_REPO in /etc/era-k8s/config.env}"
+            if [ -d "$ROOT/.git" ]; then git -C "$ROOT" pull --ff-only; else tmp=$(mktemp -d); git clone --branch "${ERA_BRANCH:-main}" "$ERA_REPO" "$tmp/repo" && rsync -a --delete --exclude .git --exclude example_reservation_agent --exclude siematic "$tmp/repo/${ERA_REPO_SUBDIR:-.}/" "$ROOT/"; rm -rf "$tmp"; fi
+            echo "era: $ROOT updated" ;;
+  mesh-recover) exec /usr/local/sbin/era-mesh-recover.sh ;;
+  config)   cat /etc/era-k8s/config.env ;;
+  *)        sed -n '2,10p' "$0"; exit 1 ;;
+esac

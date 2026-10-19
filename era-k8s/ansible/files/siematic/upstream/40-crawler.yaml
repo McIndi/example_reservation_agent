@@ -1,0 +1,76 @@
+# The SIEMatic crawler process.
+#
+# Not needed yet. Crawlers turn saved searches into findings and email alerts,
+# and no crawler has been written for this integration. The one that is
+# planned, deny detection over AuthBridge events, is still blocked on knowing
+# what a blocked call actually logs. Apply this at Phase 4, not before: an
+# extra pod that does nothing is one more thing that can be broken on the day.
+#
+# Its configuration is Python literals in SIEMatic/settings/crawler.py, so
+# changing a rule means rebuilding the image. Item 8 of the changes plan
+# moves that to a file a ConfigMap can supply. Do that before relying on this.
+#
+# The ConfigMap sets DJANGO_SETTINGS_MODULE for the web role, so the crawler
+# role is set explicitly below. Entries in env override entries from envFrom.
+#
+# Apply with: oc apply -f 40-crawler.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siematic-crawler
+  namespace: siematic
+  labels:
+    app: siematic-crawler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: siematic-crawler
+  template:
+    metadata:
+      labels:
+        app: siematic-crawler
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: crawler
+          image: ghcr.io/mcindi/siematic@sha256:b3d85c072dd9e03ac87954e613525b20f1bfa3e21d2a842a3e245bfc59dacc6b
+          command: ["python", "manage.py", "run_crawlers"]
+          envFrom:
+            - configMapRef:
+                name: siematic-app
+            - secretRef:
+                name: siematic-app
+          env:
+            - name: DJANGO_SETTINGS_MODULE
+              value: SIEMatic.settings.crawler
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-user
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-password
+            - name: DATABASE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-name
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

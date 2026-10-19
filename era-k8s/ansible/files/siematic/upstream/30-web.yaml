@@ -1,0 +1,196 @@
+# The SIEMatic web process, its Service, and the Route.
+#
+# No fixed UID or fsGroup. restricted-v2 assigns both at admission from the
+# namespace range, which the image now tolerates: group 0 owns /app and
+# /opt/venv, and HOME points somewhere writable.
+#
+# Pinned to a digest rather than a moving tag, because a deployment that
+# tracks 'latest' cannot tell you afterwards what was running when an event
+# was recorded, which is the one question an audit plane has to answer. This
+# digest is the ghcr.io/mcindi/siematic:main build of commit 85ca00a, published
+# 2026-09-09. Find a newer one with:
+#
+#   podman image inspect ghcr.io/mcindi/siematic:main --format '{{index .RepoDigests 0}}'
+#
+# Migrations run as an init container rather than a separate Job. It is
+# idempotent, it reruns on every restart, and it removes the ordering race
+# between a Job and the Deployment. project/signals.py creates the Agent and
+# Registered User groups on post_migrate of the crawlers app, so the web
+# process cannot serve correctly until this has run.
+#
+# Apply with: oc apply -f 30-web.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siematic-web
+  namespace: siematic
+  labels:
+    app: siematic-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: siematic-web
+  template:
+    metadata:
+      labels:
+        app: siematic-web
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: migrate
+          image: ghcr.io/mcindi/siematic@sha256:b3d85c072dd9e03ac87954e613525b20f1bfa3e21d2a842a3e245bfc59dacc6b
+          command: ["python", "manage.py", "migrate", "--no-input"]
+          envFrom:
+            - configMapRef:
+                name: siematic-app
+            - secretRef:
+                name: siematic-app
+          env:
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-user
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-password
+            - name: DATABASE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-name
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      containers:
+        - name: web
+          image: ghcr.io/mcindi/siematic@sha256:b3d85c072dd9e03ac87954e613525b20f1bfa3e21d2a842a3e245bfc59dacc6b
+          envFrom:
+            - configMapRef:
+                name: siematic-app
+            - secretRef:
+                name: siematic-app
+          env:
+            - name: DATABASE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-user
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-password
+            - name: DATABASE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: siematic-postgres
+                  key: database-name
+          ports:
+            - name: https
+              containerPort: 8000
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: serving-cert
+              mountPath: /etc/tls/private
+              readOnly: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          # These two paths are exempt from the HTTPS redirect in settings, so
+          # a probe gets a 200 rather than a 301. readyz runs one SELECT 1, so
+          # a pod with a broken database connection leaves the Service.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+              scheme: HTTPS
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+              scheme: HTTPS
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+              scheme: HTTPS
+              httpHeaders:
+                - name: Host
+                  value: localhost
+            periodSeconds: 10
+      volumes:
+        - name: serving-cert
+          secret:
+            secretName: siematic-web-tls
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: siematic-web
+  namespace: siematic
+  labels:
+    app: siematic-web
+  annotations:
+    # OpenShift issues the certificate into this Secret and rotates it. That
+    # is what the pod serves and what the Route reencrypts to.
+    service.beta.openshift.io/serving-cert-secret-name: siematic-web-tls
+spec:
+  ports:
+    - name: https
+      port: 8000
+      targetPort: 8000
+  selector:
+    app: siematic-web
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: siematic
+  namespace: siematic
+  labels:
+    app: siematic-web
+spec:
+  host: siematic.apps.openshift.example.com
+  to:
+    kind: Service
+    name: siematic-web
+  port:
+    targetPort: https
+  tls:
+    # Reencrypt, not edge. The traffic stays encrypted from the router to the
+    # pod, which is the posture the rest of this demo argues for.
+    termination: reencrypt
+    insecureEdgeTerminationPolicy: Redirect

@@ -1,5 +1,9 @@
 # Example reservation agent and tool
 
+> **Run it on your own single-node cluster:** [`era-k8s/`](era-k8s/) (this branch) has a Lima template,
+> Vagrant boxes for VirtualBox and VMware, and the `era` command that installs the platform, this agent,
+> OpenBao and SIEMatic. Start with [era-k8s/docs/running-the-box.md](era-k8s/docs/running-the-box.md).
+
 A worked example of a custom Rossoctl agent and its MCP tool, in the same
 shape as the platform's own weather-service / weather-tool example. The
 agent negotiates a reservation time with a customer over chat; the tool

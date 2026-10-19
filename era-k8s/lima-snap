@@ -1,0 +1,52 @@
+#!/bin/zsh
+# lima-snap -- whole-disk snapshots for Lima instances on the vz driver, where `limactl snapshot` is
+# unimplemented. Uses APFS copy-on-write clones (cp -c): instant, and only blocks that later diverge
+# take space. The instance must be stopped (a few seconds). Same model as `vagrant snapshot`.
+#
+#   lima-snap create INSTANCE TAG     clone ~/.lima/INSTANCE/disk to ~/.lima/INSTANCE/snapshots/TAG.disk
+#   lima-snap apply  INSTANCE TAG     replace the instance disk with a clone of TAG (the current disk is lost)
+#   lima-snap list   INSTANCE         tags with date and real (allocated) size
+#   lima-snap delete INSTANCE TAG
+#
+# lima.yaml is saved next to each snapshot for reference (cpus/memory/mounts at the time).
+set -euo pipefail
+cmd="${1:-}"; inst="${2:-}"; tag="${3:-}"
+die() { print -u2 -- "lima-snap: $*"; exit 1; }
+[[ -n "$cmd" && -n "$inst" ]] || die "usage: lima-snap create|apply|list|delete INSTANCE [TAG]"
+dir="$HOME/.lima/$inst"; snaps="$dir/snapshots"
+[[ -f "$dir/lima.yaml" ]] || die "no Lima instance '$inst' ($dir)"
+st=$(limactl list "$inst" --format '{{.Status}}' 2>/dev/null || true)
+need_stopped() { [[ "$st" == "Stopped" ]] || die "instance '$inst' is '$st'; run: limactl stop $inst"; }
+need_tag() { [[ -n "$tag" ]] || die "a TAG is required"; [[ "$tag" =~ '^[A-Za-z0-9._-]+$' ]] || die "tag may contain letters, digits, . _ -"; }
+case "$cmd" in
+  create)
+    need_tag; need_stopped
+    [[ -e "$snaps/$tag.disk" ]] && die "snapshot '$tag' already exists (delete it first)"
+    mkdir -p "$snaps"
+    cp -c "$dir/disk" "$snaps/$tag.disk"
+    cp "$dir/lima.yaml" "$snaps/$tag.lima.yaml"
+    print -- "created $inst:$tag ($(du -sh "$snaps/$tag.disk" | cut -f1) allocated, shared with the live disk until it diverges)"
+    ;;
+  apply)
+    need_tag; need_stopped
+    [[ -f "$snaps/$tag.disk" ]] || die "no snapshot '$tag' for '$inst'"
+    rm -f "$dir/disk"
+    cp -c "$snaps/$tag.disk" "$dir/disk"
+    print -- "applied $inst:$tag; start with: limactl start $inst"
+    ;;
+  list)
+    [[ -d "$snaps" ]] || { print -- "no snapshots for $inst"; exit 0; }
+    print -- "live disk: $(du -sh "$dir/disk" | cut -f1) allocated of $(( $(stat -f %z "$dir/disk") / 1073741824 )) GiB"
+    for f in "$snaps"/*.disk(N); do
+      t="${${f:t}%.disk}"
+      print -- "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$f")  $(du -sh "$f" | cut -f1)  $t"
+    done
+    ;;
+  delete)
+    need_tag
+    [[ -f "$snaps/$tag.disk" ]] || die "no snapshot '$tag' for '$inst'"
+    rm -f "$snaps/$tag.disk" "$snaps/$tag.lima.yaml"
+    print -- "deleted $inst:$tag"
+    ;;
+  *) die "unknown command '$cmd'" ;;
+esac

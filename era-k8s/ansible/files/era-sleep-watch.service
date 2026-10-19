@@ -1,0 +1,8 @@
+[Unit]
+Description=era-k8s: refresh gateway credentials after the VM was suspended (run by era-sleep-watch.timer)
+ConditionPathExists=/etc/kubernetes/admin.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/era-sleep-watch.sh
+StandardOutput=journal
