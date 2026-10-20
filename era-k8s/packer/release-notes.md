@@ -1,4 +1,4 @@
-# era-k8s images, 2026-10-18, rebuilt 2026-10-20
+# era-k8s images, 2026-10-18, rebuilt 2026-10-21
 
 A single-node Kubernetes VM (Fedora 44, kubeadm v1.37.1, CRI-O, Calico v3.33, local-path storage, SELinux enforcing,
 firewalld) with the rossoctl platform tooling baked in. Every file is the same pre-init image: everything installed,
@@ -24,8 +24,10 @@ Login on every image: user `vagrant`, password `vagrant` (sudo without password)
 Sizing: 8 CPUs and 24 GB are the defaults the demo was rehearsed with; 4 CPUs and 16 GB work for the cluster and the
 platform, with a slower in-cluster LLM. The disk is 100 GB thin.
 
-The 2026-10-20 build replaces the 2026-10-18 files: the first-boot init now retries the Calico CRD wait, which could
-fail on a very slow machine in the first build (`sudo era init` resumed it). Nothing else changed.
+The 2026-10-21 build replaces the 2026-10-20 files: `era verify` now waits up to 200 s for system pods that are still
+starting (a slow host, or emulation) instead of failing at once. The 2026-10-20 build had added a retry to the Calico
+CRD wait in the first-boot init, which could fail on a very slow machine in the 2026-10-18 build (`sudo era init`
+resumed it). Nothing else changed.
 
 Tested on this build: both Vagrant boxes (VirtualBox and VMware Fusion on an Intel Mac: first boot, reboot, `era verify`),
 the VirtualBox OVA and the VMware OVA (same checks), the arm64 VDI on VirtualBox 7.2 on an M1 Mac, the amd64 qcow2

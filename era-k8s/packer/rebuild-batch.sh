@@ -7,6 +7,9 @@
 #   4. arm64 qcow2 + vmdk from the VDI (export/convert.sh), the VDI zipped, SHA256SUMS
 #   5. only when every test passed: the assets of the GitHub release replaced (--clobber), title and notes updated
 #      (release-notes.md), the remote SHA256SUMS compared with the local one
+#   6. then the public branch: the one commit prepared beforehand in the public clone (ERA_PUBLIC_CLONE; the release
+#      notes for this build) is pushed, after a fail-closed private-string gate on its diff (the pattern list lives
+#      outside the repo: ERA_PRIVATE_RE_FILE, default ~/.config/era-k8s/private-strings, one extended regex per line)
 # Logs: rebuild-batch.log (everything), rebuild-batch/<step>.log, one line per step in rebuild-batch.status.
 # The previous output/ set is kept as output-prev/. Written for one unattended run on RELEASE_DAY; refuses to run on
 # another day unless FORCE=1. --check runs the preconditions only. ERA_ARM64_HOST names the Apple-silicon Mac that
@@ -14,7 +17,9 @@
 set -uo pipefail
 export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Applications/VMware Fusion.app/Contents/Public"   # vmrun
 cd "$(dirname "$0")"; PK="$PWD"; REPO="$(dirname "$PK")"
-M1=${ERA_ARM64_HOST:-arm64-mac}; TAG=era-k8s-images-2026-10-18; GHREPO=McIndi/example_reservation_agent; RELEASE_DAY=2026-10-20
+M1=${ERA_ARM64_HOST:-arm64-mac}; TAG=era-k8s-images-2026-10-18; GHREPO=McIndi/example_reservation_agent; RELEASE_DAY=2026-10-21
+PUBCLONE=${ERA_PUBLIC_CLONE:-$HOME/Documents/github/McIndi/example_reservation_agent}; PUBBRANCH=era-k8s
+PRIVATE_RE_FILE=${ERA_PRIVATE_RE_FILE:-$HOME/.config/era-k8s/private-strings}
 L="$PK/rebuild-batch"; STATUS="$PK/rebuild-batch.status"
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 $M1"
 RPATH='export PATH=$HOME/.local/share/mise/shims:$HOME/.local/bin:/usr/local/bin:$PATH'
@@ -41,6 +46,8 @@ pre() {
   (cd "$REPO" && git status --porcelain | grep -v '^??' | grep -q .) && fail "uncommitted changes in $REPO"
   (cd "$REPO" && bin/render-template --check >/dev/null 2>&1) || fail "k8s.yaml is not current (bin/render-template)"
   local avail; avail=$(df -g "$PK" | awk 'NR==2{print $4}'); [ "$avail" -gt 60 ] || fail "only ${avail} GB free"
+  [ -s "$PRIVATE_RE_FILE" ] || fail "no private-string list at $PRIVATE_RE_FILE (ERA_PRIVATE_RE_FILE)"
+  public_ready || fail "public clone not ready for step 6 (see above)"
   log "preconditions OK (Fusion idle, VirtualBox idle, podman VM up, gh ok, $M1 reachable, tree clean, ${avail} GB free)"
 }
 
@@ -81,6 +88,27 @@ publish() {   # step 5 on the set in output/ (also `rebuild-batch.sh --publish`,
   status "PUBLISHED: all ${#ASSETS[@]} assets of $TAG replaced, remote SHA256SUMS identical ($(el) total)"
 }
 
+public_ready() {   # the public clone holds exactly one unpushed commit on $PUBBRANCH, clean, with this build's release notes
+  [ -d "$PUBCLONE/.git" ] || { log "no public clone at $PUBCLONE (ERA_PUBLIC_CLONE)"; return 1; }
+  ( cd "$PUBCLONE" && git fetch -q origin "$PUBBRANCH" && [ "$(git branch --show-current)" = "$PUBBRANCH" ] \
+    && [ -z "$(git status --porcelain)" ] && [ "$(git rev-parse HEAD~1)" = "$(git rev-parse "origin/$PUBBRANCH")" ] ) \
+    || { log "public clone: not on $PUBBRANCH, dirty, or not exactly one commit ahead of origin/$PUBBRANCH"; return 1; }
+  cmp -s "$PUBCLONE/era-k8s/packer/release-notes.md" "$PK/release-notes.md" || { log "public clone: release-notes.md differs from packer/release-notes.md"; return 1; }
+  git -C "$PUBCLONE" ls-remote --exit-code -q origin "$PUBBRANCH" >/dev/null 2>&1 || { log "public clone: origin unreachable"; return 1; }
+}
+
+push_public() {   # step 6; the gate fails closed: grep rc 0 (a hit) and 2 (an error) both stop the push, only 1 passes
+  public_ready || return 1
+  ( cd "$PUBCLONE" && git diff "origin/$PUBBRANCH..HEAD" -U0 | grep -E '^[+]' | grep -v -E '^[+]{3}' ) > "$L/push-added.txt"
+  [ -s "$L/push-added.txt" ] || { log "step 6: empty diff"; return 1; }
+  grep -i -E -f "$PRIVATE_RE_FILE" "$L/push-added.txt" > "$L/push-gate.txt" 2>&1; local rc=$?
+  [ "$rc" = 1 ] || { log "step 6: gate rc=$rc (0 = private string in the diff, 2 = grep error; rebuild-batch/push-gate.txt)"; return 1; }
+  log "step 6: gate passed on $(wc -l < "$L/push-added.txt" | tr -d ' ') added lines; pushing $PUBBRANCH"
+  ( cd "$PUBCLONE" && git push origin "$PUBBRANCH" ) >> "$L/push.log" 2>&1 || { log "step 6: git push failed (rebuild-batch/push.log)"; return 1; }
+  ( cd "$PUBCLONE" && git fetch -q origin "$PUBBRANCH" && [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$PUBBRANCH")" ] ) || { log "step 6: remote head differs after the push"; return 1; }
+  status "PUSHED: public branch $PUBBRANCH at $(git -C "$PUBCLONE" rev-parse --short HEAD)"
+}
+
 run_test() { local name=$1; shift; log "-- test $name"; if "$@" > "$L/test-$name.log" 2>&1; then status "test $name OK ($(el))"; else status "test $name FAILED (rebuild-batch/test-$name.log)"; TESTFAIL=1; fi; }
 
 if [ "${1:-}" = --check ]; then STATUS=/dev/null; pre; exit 0; fi
@@ -89,7 +117,7 @@ if [ "${1:-}" = --publish ]; then
   exec > >(tee -a "$PK/rebuild-batch.log") 2>&1
   status "PUBLISH only: the set in output/ (tests passed by hand)"
   gh auth status >/dev/null 2>&1 || fail "gh is not logged in"; [ -f "$PK/release-notes.md" ] || fail "no release-notes.md"
-  publish; status "DONE"; exit 0
+  publish; push_public || fail "step 6 (the release IS published)"; status "DONE"; exit 0
 fi
 [ "${FORCE:-}" = 1 ] || [ "$(date +%F)" = "$RELEASE_DAY" ] || { echo "today is $(date +%F), not $RELEASE_DAY (FORCE=1 to run anyway)" >&2; exit 1; }
 mkdir -p "$L"; mkdir "$L/.lock" 2>/dev/null || { echo "another run holds $L/.lock" >&2; exit 1; }
@@ -130,4 +158,5 @@ status "set complete: $(du -sh "$PK/output" | cut -f1) in output/ ($(el))"
 
 [ "$TESTFAIL" = 0 ] || fail "a test failed; nothing uploaded, the release is unchanged"
 publish
+push_public || fail "step 6 (the release IS published)"
 status "DONE"
