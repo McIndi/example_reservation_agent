@@ -44,16 +44,26 @@
           - (nodes.resources[0].status.conditions | selectattr('type','equalto','Ready') | map(attribute='status') | first) == 'True'
         fail_msg: "node not Ready: {{ nodes.resources | map(attribute='status.conditions') | list }}"
 
-    - name: Pods in kube-system, calico-system, local-path-storage, tigera-operator
+    # A slow host (first boot under emulation) can still be starting a pod when verify runs: poll each namespace
+    # for up to 200 s, like the PVC wait below, and let the assert after it name what never came up.
+    - name: Pods in kube-system, calico-system, local-path-storage, tigera-operator (polls up to 200 s)
       kubernetes.core.k8s_info:
         kind: Pod
         namespace: "{{ item }}"
       loop: [kube-system, calico-system, tigera-operator, local-path-storage]
       register: pods
+      until:
+        - (pods.resources | default([]) | length) > 0
+        - (pods.resources | default([]) | rejectattr('status.phase', 'in', ['Running','Succeeded']) | list | length) == 0
+      retries: 40
+      delay: 5
+      failed_when: false
     - name: Every pod Running or Succeeded
       ansible.builtin.assert:
-        that: (item.resources | rejectattr('status.phase', 'in', ['Running','Succeeded']) | list | length) == 0
-        fail_msg: "{{ item.item }}: {{ item.resources | rejectattr('status.phase','in',['Running','Succeeded']) | map(attribute='metadata.name') | list }}"
+        that:
+          - (item.resources | default([]) | length) > 0
+          - (item.resources | rejectattr('status.phase', 'in', ['Running','Succeeded']) | list | length) == 0
+        fail_msg: "{{ item.item }}: {{ item.msg | default('') }} {{ item.resources | default([]) | rejectattr('status.phase','in',['Running','Succeeded']) | map(attribute='metadata.name') | list }} (after {{ item.attempts | default(1) }} attempts)"
       loop: "{{ pods.results }}"
       loop_control: { label: "{{ item.item }}" }
 

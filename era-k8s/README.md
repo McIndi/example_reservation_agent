@@ -49,6 +49,13 @@ installed, tuned, images pre-pulled, the playbooks and `era` baked in; `k8s-init
 the cluster at the first boot. The OVAs are the hypervisors' own exports of the same VMs; the qcow2 is the
 VMware disk converted by qemu-img (in the `podman` Lima VM, as Intel macOS has no qemu-img).
 
+Tests: `packer/test/vagrant-box.sh virtualbox|vmware_desktop` registers the box, runs `vagrant up`, waits for the
+first-boot init, reboots, checks the node and the pods, runs `era verify` and destroys the machine;
+`test/virtualbox-ova.sh`, `test/vmware-ova.sh` and `test/qcow2-qemu.sh` do the same for the other forms.
+`packer/rebuild-batch.sh` is the unattended run: the x86_64 builds here, the arm64 disk on the Apple silicon Mac
+named by `ERA_ARM64_HOST`, every test, and the GitHub release's assets replaced only when all of them passed
+(`release-notes.md` is the release text).
+
 ## arm64 images (from the Lima template, on an Apple silicon Mac)
 
 ```bash
