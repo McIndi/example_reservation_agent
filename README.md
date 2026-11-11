@@ -1,3 +1,5 @@
+> Example / tutorial companion. Not maintained for production use.
+
 # Example reservation agent and tool
 
 A worked example of a custom Rossoctl agent and its MCP tool, in the same
